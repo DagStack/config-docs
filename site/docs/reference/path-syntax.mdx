@@ -1,0 +1,138 @@
+---
+sidebar_position: 2
+title: Синтаксис путей
+description: Точные правила dot-notation для доступа к значениям — вложенные объекты, индексы массивов, экранирование точек в ключах, различия с JSON Pointer.
+slug: /reference/path-syntax
+---
+
+# Синтаксис путей
+
+Значения в конфиге адресуются **dot-notation путями** — цепочкой имён ключей, разделённых точкой, с опциональными индексами массивов в квадратных скобках. Этот синтаксис — нормативная часть контракта: реализации на любом языке интерпретируют один и тот же путь одинаково.
+
+Нормативный источник — [`config-spec/adr/0001-yaml-configuration.md` §4.2](https://git.goldix.org/dagstack/config-spec/src/branch/main/adr/0001-yaml-configuration.md).
+
+## Базовая форма
+
+```
+llm.base_url                      # объект → поле
+rag.search.top_k                  # вложенный путь
+dagstack.plugin_dirs[0]           # элемент массива
+dagstack.plugin_dirs[*]           # весь массив
+```
+
+| Конструкция | Значение |
+|---|---|
+| `foo` | Поле верхнего уровня |
+| `foo.bar` | Поле `bar` внутри объекта `foo` |
+| `foo.bar.baz` | Глубокая вложенность (не ограничено) |
+| `foo[0]` | Первый элемент массива `foo` (0-based индексация) |
+| `foo[2].bar` | Поле `bar` третьего элемента массива |
+| `foo[*]` | Весь массив целиком (эквивалентно `config.getList("foo")`) |
+
+## Индексация массивов
+
+- **0-based** — первый элемент `[0]`, не `[1]`.
+- **Отрицательные индексы не поддерживаются** — `foo[-1]` → `ConfigError(reason: parse_error)`. Используй `config.getList("foo")[-1]` в native-языке.
+- **Out-of-bounds** — `foo[99]` для массива длины 3 → `ConfigError(reason: missing)`.
+- **Индекс на не-массиве** — `foo[0]` где `foo` — объект → `ConfigError(reason: type_mismatch)`.
+
+## Экранирование точек в ключах
+
+Иногда ключ содержит точку — например, Kubernetes-labels (`kubernetes.io/zone`). Экранируй её обратным слэшем:
+
+```
+labels.kubernetes\.io/zone        # путь к ключу "kubernetes.io/zone" в объекте "labels"
+```
+
+**Правила:**
+
+- `.` — единственный специальный символ, экранируемый через `\` в контракте v1.0.
+- Чтобы получить литеральный backslash в имени ключа — `\\`.
+- Ключи с `[`, `]`, `*` — спецификация не гарантирует достижимость через dot-notation. Реализация MAY предоставить альтернативный API со списком сегментов (`config.getPath(["labels", "weird[key]"])`) — используй его, если не можешь переименовать поле.
+- Если конфиг гарантированно контролируемый, проще избегать ключей с `.`, `[`, `]`, `*` — используй snake_case / kebab-case.
+
+## Примеры из реального конфига
+
+```yaml title="app-config.yaml"
+app:
+  name: "order-service"
+database:
+  host: "localhost"
+  pool:
+    size: 20
+    timeout_ms: 5000
+features:
+  - name: "a"
+    enabled: true
+  - name: "b"
+    enabled: false
+labels:
+  kubernetes.io/zone: "eu-west-1a"
+  app.kubernetes.io/instance: "prod-42"
+```
+
+| Путь | Значение |
+|---|---|
+| `app.name` | `"order-service"` |
+| `database.host` | `"localhost"` |
+| `database.pool.size` | `20` |
+| `database.pool.timeout_ms` | `5000` |
+| `features[0].name` | `"a"` |
+| `features[1].enabled` | `false` |
+| `features[*]` | весь массив из 2 элементов |
+| `labels.kubernetes\.io/zone` | `"eu-west-1a"` |
+| `labels.app\.kubernetes\.io/instance` | `"prod-42"` |
+
+## Поведение методов доступа
+
+| Метод | Путь отсутствует | Несовпадение типа |
+|---|---|---|
+| `has(path)` | `false` | `false` |
+| `get(path)` | `ConfigError(missing)` | возвращает raw |
+| `get(path, default)` | `default` | возвращает raw |
+| `getString(path)` | `ConfigError(missing)` | `ConfigError(type_mismatch)` |
+| `getString(path, default)` | `default` | `ConfigError(type_mismatch)` |
+| `getInt(path)` | `ConfigError(missing)` | `ConfigError(type_mismatch)` |
+| `getInt(path, default)` | `default` | `ConfigError(type_mismatch)` |
+| `getNumber(path)` | `ConfigError(missing)` | `ConfigError(type_mismatch)` |
+| `getNumber(path, default)` | `default` | `ConfigError(type_mismatch)` |
+| `getBool(path)` | `ConfigError(missing)` | `ConfigError(type_mismatch)` |
+| `getBool(path, default)` | `default` | `ConfigError(type_mismatch)` |
+| `getList(path)` | `ConfigError(missing)` | `ConfigError(type_mismatch)` |
+| `getSection(path, schema)` | `ConfigError(missing)` | `ConfigError(validation_failed)` с указанием поля |
+
+**Type coercion для значений, полученных через env interpolation:**
+
+- `getInt` — строка, матчащая `^-?\d+$` (`"42"`, `"-5"`, `"0"`).
+- `getNumber` — строка с плавающей точкой, стандартный парсер языка (`"3.14"`, `"1e5"`). Точный формат — реализация binding; как минимум принимаются `\d+`, `\d+\.\d+`, `\d+[eE][-+]?\d+`.
+- `getBool` — `true` / `false` / `yes` / `no` / `1` / `0` (case-insensitive).
+
+Любое другое представление — `type_mismatch` с детализацией (`expected`, `actual`).
+
+## Отличия от JSON Pointer (RFC 6901)
+
+Dagstack dot-notation и JSON Pointer решают похожую задачу, но синтаксис разный:
+
+| Операция | Dagstack | JSON Pointer |
+|---|---|---|
+| Поле объекта | `foo.bar` | `/foo/bar` |
+| Элемент массива | `foo[0]` | `/foo/0` |
+| Экранирование `.` | `labels.kubernetes\.io/zone` | `/labels/kubernetes.io~1zone` (где `~1` = `/`) |
+| Корневой объект | `""` (пустая строка) — не поддерживается; используй `getSection("")` | `""` (пустая строка) |
+| URI-referenceable fragments | — | `#/foo/bar` |
+
+Dagstack выбрал dot-notation по опыту Backstage / Spring Boot / Viper — для читабельного обращения к конфигу из кода. JSON Pointer читается хуже (`/foo/bar/baz` vs `foo.bar.baz`) и требует экранирования слэша и тильды в ключах.
+
+## Типичные ошибки
+
+- **Разделитель `/` или `->`.** Неправильно: `foo/bar`, `foo->bar`. Только `.`.
+- **Квадратные скобки вокруг имени.** `foo.[0]` неверно; `foo[0]` — верно. Скобки сразу после имени, без точки.
+- **Индекс как ключ.** `foo.0` интерпретируется как поле с именем `"0"`, не как индекс массива. Для массива — `foo[0]`.
+- **Пробелы в пути.** `foo .bar` → `ConfigError(parse_error)`. Путь не должен содержать пробелов.
+- **Wildcard `*` без `[…]`.** `foo.*` не поддерживается. Только `foo[*]` для массива.
+
+## См. также
+
+- [Типизированный доступ](../guides/declaring-section) — как `getSection(path, schema)` использует пути.
+- [Таксономия ошибок](./errors) — коды `missing`, `type_mismatch`, `parse_error`, `validation_failed`.
+- [ADR-0001 §4.2](../spec/adr/0001-yaml-configuration) — нормативное описание.

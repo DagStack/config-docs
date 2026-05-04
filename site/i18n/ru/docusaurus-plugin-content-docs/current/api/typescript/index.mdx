@@ -1,0 +1,41 @@
+---
+sidebar_position: 1
+title: TypeScript API — обзор
+description: Навигация по справочнику публичного API пакета @dagstack/config; страницы генерируются TypeDoc из исходников.
+slug: /api/typescript
+---
+
+# TypeScript API — обзор
+
+Справочник генерируется автоматически из исходников npm-пакета `@dagstack/config` через [TypeDoc](https://typedoc.org/) плюс markdown-плагин.
+
+:::info Генерация отложена
+Страницы для этого первого релиза не сгенерированы. Запуск — `make
+api-typescript` (target появится в `Makefile`, как только TypeDoc-пайплайн
+будет интегрирован). Содержимое появится в последующих коммитах, когда
+реализация стабилизируется.
+:::
+
+## Содержание справочника (планируется)
+
+| Модуль | Что покрывает |
+|---|---|
+| `@dagstack/config` | Публичный верхний уровень — `Config`, `load`, `loadFrom`, геттеры, ошибки. |
+| `@dagstack/config` — sources | Интерфейс `ConfigSource`, `YamlFileSource`, `JsonFileSource`, `InMemorySource`. |
+| `@dagstack/config` — errors | `ConfigError`, `ConfigErrorReason`. |
+
+## Локальная генерация
+
+```bash
+cd config-typescript
+git submodule update --init
+npm install
+npm run docs      # как только TypeDoc-пайплайн интегрирован
+```
+
+## Пока справочник не сгенерирован
+
+- JSDoc из исходников видно в IDE (VSCode / WebStorm / Neovim с LSP).
+- Типы `.d.ts` доступны после `npm install @dagstack/config`.
+- Страницы руководств: [Объявление секции](/docs/guides/declaring-section), [Тестирование](/docs/guides/testing).
+- Спецификация: [ADR-0001](/docs/spec/adr/0001-yaml-configuration).

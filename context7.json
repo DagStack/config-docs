@@ -1,0 +1,58 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "dagstack/config",
+  "description": "Hierarchical YAML configuration stack for the dagstack ecosystem — env interpolation, layered merge, typed sections, hot-reload, secret masking. One contract across Python, TypeScript, Go.",
+  "folders": [
+    "site/docs",
+    "README.md"
+  ],
+  "excludeFolders": [
+    "node_modules",
+    "**/node_modules",
+    "site/build",
+    "site/.docusaurus",
+    "site/src",
+    "site/static",
+    "site/i18n",
+    "**/dist",
+    "**/.turbo",
+    "blog",
+    ".github",
+    ".gitea"
+  ],
+  "excludeFiles": [
+    "CHANGELOG.md",
+    "LICENSE.md",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "site/docusaurus.config.ts",
+    "site/sidebars.ts",
+    "site/package.json",
+    "site/tsconfig.json",
+    "site/package-lock.json",
+    "site/README.md"
+  ],
+  "rules": [
+    "Install with: pip install dagstack-config (Python, pypi.org) / npm install @dagstack/config (TypeScript, npmjs.org) / go get go.dagstack.dev/config (Go vanity URL backed by github.com/dagstack/config-go).",
+    "Load configuration with Config.load(path) — it reads base file, discovers app-config.local.yaml and app-config.${DAGSTACK_ENV}.yaml siblings, merges all three layers (base → local → env), performs env-interpolation, returns Config object.",
+    "Config layering: base app-config.yaml is checked into repo; app-config.local.yaml is gitignored (developer overrides); app-config.${ENV}.yaml is environment-specific (production, staging). Merge is deep for maps, arrays are replaced atomically.",
+    "DAGSTACK_ENV is the canonical env variable for selecting environment layer — use this instead of APP_ENV / NODE_ENV / RAILS_ENV to avoid cross-framework collisions in multi-framework deployments.",
+    "Env interpolation: ${VAR} raises ConfigError(env_unresolved) if VAR not set; ${VAR:-default} falls back to literal default. Interpolated values are always strings; typed coercion happens at typed getter call.",
+    "Escape literal dollar sign in YAML values with $$ → $. Applies to any string value, including contexts without ${...}.",
+    "Access config values by dot-notation paths: config.get('database.host'), config.getInt('cache.ttl_min'). Array indexing: config.get('plugins[0]'), config.getList('plugins'). Casing per language: snake_case (Python), camelCase (TS), PascalCase (Go).",
+    "Use config.getSection(path, schema) for typed access — it validates against pydantic BaseModel (Python), zod schema (TypeScript), or struct tags (Go). On failure it raises ConfigError(validation_failed) pointing at the specific field.",
+    "Plugins read only their own section via config.getSection(plugin.kind + '.' + plugin.name, PluginConfigSchema). Reading sibling plugin sections is an anti-pattern.",
+    "Primitive getters: get (raw Value), getString, getInt, getNumber, getBool, getList, has. Without default arg, missing key raises ConfigError(missing). Type mismatch raises ConfigError(type_mismatch).",
+    "ConfigError has structural fields: path (dot-notation), reason (missing | type_mismatch | env_unresolved | validation_failed | parse_error | source_unavailable | reload_rejected), details (human message), source_id (optional).",
+    "Secrets are masked in diagnostic output by field name pattern: api_key, secret_key, access_token, password, client_secret — and any field ending in _secret, _token, _password, _key. Full list in config-spec/_meta/secret_patterns.yaml.",
+    "Subscribe to runtime config changes via on_section_change / onSectionChange / OnSectionChange (per language) — returns Subscription with unsubscribe, active, inactive_reason. Sources without watch register active=false reason subscription_without_watch.",
+    "Hot-reload is atomic at tree-level: if reload validation fails for any subscriber, entire reload is rolled back, no subscribers are notified. This prevents partial-application of invalid configs.",
+    "ConfigSource is the abstraction for non-file sources — Phase 2+ adapters for etcd, Consul, Vault, HTTP, SQL, Kubernetes ConfigMaps. Each source provides id, load(), optional watch(callback), close() contract.",
+    "Canonical JSON format (RFC 8785 subset) is used for deterministic serialization in cross-process transmission and hash computation. Sorted keys, no trailing whitespace, LF line endings, numbers without unnecessary decimals.",
+    "Use Config.loadFrom(sources[]) for explicit source layering — precedence equals argument order (first is lowest priority, last is highest). Replaces auto-discovery with explicit listing when needed.",
+    "YAML wire-format is identical across languages — same file parses to same Config in Python / TypeScript / Go. JSON is acceptable as equivalent wire-format (YAML 1.2 is JSON superset).",
+    "Do not write secrets into app-config.yaml (which is committed to git) — use env variables: api_key: ${OPENAI_API_KEY}. The Config stack resolves env at load time; secret values never reach git.",
+    "Use app-config.local.yaml for developer-specific overrides that should not be committed — it's in default .gitignore. For environment-specific public overrides use app-config.${DAGSTACK_ENV}.yaml (committed).",
+    "The language-agnostic contract is fixed in config-spec/adr/0001-yaml-configuration.md — Python, TypeScript, Go bindings follow same wire-format, path syntax, error taxonomy, subscription semantics."
+  ]
+}

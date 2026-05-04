@@ -1,0 +1,177 @@
+---
+sidebar_position: 1
+title: Sources (ConfigSource)
+description: The ConfigSource abstraction — where the config comes from. YAML files, env, future adapters for etcd / Consul / Vault / HTTP / SQL / K8s.
+slug: /concepts/sources
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Configuration sources
+
+`ConfigSource` is an abstraction over the place a configuration is loaded from. In Phase 1 the primary source is `YamlFileSource` (files on disk), but the API is designed for extension. Phase 2+ adds adapters for centralized configuration stores:
+
+| Source | Example | Status |
+|---|---|---|
+| `YamlFileSource` | `app-config.yaml` on disk | **Phase 1 (default)** |
+| `JsonFileSource` | `app-config.json` on disk | **Phase 1** |
+| `InMemorySource` (Python/TS) / `DictSource` (Go) | A dict assembled programmatically — for tests | **Phase 1** |
+| Env interpolation `${VAR}` | Reads the environment while processing raw text | **Phase 1** (built in, not a separate source) |
+| `EtcdSource` | Keys in etcd under a prefix | Phase 2 (planned) |
+| `ConsulSource` | KV store in Consul | Phase 2 (planned) |
+| `VaultSource` | Secrets in HashiCorp Vault | Phase 2 (planned) |
+| `HttpSource` | A REST endpoint returning JSON | Phase 2 (planned) |
+| `SqlSource` | A database table with config that changes at runtime | Phase 2 (planned) |
+| `KubernetesSource` | A ConfigMap + Secret in Kubernetes | Phase 2 (planned) |
+
+## The interface
+
+Every source implements a minimal contract:
+
+```
+id:                     string                              # unique source identifier (e.g. "yaml:/app/config.yaml")
+load():                 ConfigTree                           # one-shot load (required)
+watch?(callback):       Subscription                         # subscribe to changes (optional)
+close?():               void                                 # release resources (optional)
+```
+
+`load()` returns a **ConfigTree** — a tree of values that the loader then merges with other sources and runs through env interpolation.
+
+`watch(callback)` is optional. If the source supports watching (a file via fsnotify; etcd via a gRPC stream; Kubernetes via an informer), the loader passes a callback that is invoked when the source detects a change. If the source does not support it, the method is omitted; subscriptions for changes are still registered, but they activate with `active = false`.
+
+## The default scenario — YamlFileSource
+
+For most dagstack applications, `Config.load(path)` is a high-level wrapper over `Config.loadFrom([YamlFileSource(path), ...])`. It automatically discovers and wires up three layers:
+
+1. `app-config.yaml` — base (committed).
+2. `app-config.local.yaml` — developer overrides (gitignored).
+3. `app-config.${DAGSTACK_ENV}.yaml` — environment-specific (committed).
+
+Layer mechanics are documented on the [Layers](./layers) page.
+
+## Listing sources explicitly
+
+When you need a non-standard order (for example, in tests) or a mix of source types, use `Config.loadFrom`:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.config import Config, YamlFileSource, InMemorySource
+
+    config = Config.load_from([
+        YamlFileSource("app-config.yaml"),
+        InMemorySource({"database": {"pool_size": 5}}),    # test override
+    ])
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { Config, YamlFileSource, InMemorySource } from "@dagstack/config";
+
+    const config = await Config.loadFrom([
+      new YamlFileSource("app-config.yaml"),
+      new InMemorySource({ database: { pool_size: 5 } }),
+    ]);
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    cfg, err := config.LoadFrom(context.Background(), []config.Source{
+        config.NewYamlFileSource("app-config.yaml"),
+        config.NewDictSource(config.Tree{"database": map[string]any{"pool_size": 5}}),
+    })
+    ```
+  </TabItem>
+</Tabs>
+
+:::note In-memory source name
+In Python and TypeScript the source is called `InMemorySource`; in Go it is `DictSource`. This is a historical divergence between the bindings; the semantics are identical (an in-memory tree, with no interpolation by default).
+:::
+
+**Argument order = priority order**. The first source has the lowest priority; the last has the highest (it overrides the earlier ones).
+
+## Environment variable substitution
+
+Env variables are not a separate `ConfigSource`, but a processing stage applied to values in the loaded ConfigTree. String values of the form `${VAR}` or `${VAR:-default}` are interpolated immediately after `source.load()`, before merging with other sources.
+
+Details are on the [Environment variable substitution](./substitution) page.
+
+## Watch semantics and hot reload
+
+When the application subscribes to changes for its section through `config.onSectionChange(path, callback)`, the loader registers a watcher on every source that supports watching:
+
+1. `source.watch(on_source_change)` is registered on every source.
+2. Any change in a source → the loader re-assembles the tree.
+3. The new version is validated (if subscribed sections have a schema).
+4. If validation passes, subscribers receive the new values.
+5. If validation fails, the entire reload is rolled back; subscribers are **not notified** (atomic rollback).
+
+If no source supports watching, every subscription is registered with `active = false`. This is not an error: an application can still start up successfully without hot reload.
+
+For details, see [Hot reload (watch)](./watch).
+
+## Implementing your own ConfigSource
+
+The v1.0 contract pins down the signatures, but not the on-disk format. If you need a custom source (for example, ZooKeeper), implement the interface and pass an instance to `Config.loadFrom`:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.config import ConfigSource, ConfigTree, Subscription
+
+    class ZookeeperSource(ConfigSource):
+        id = "zookeeper://zk.example.com/my-app"
+
+        def __init__(self, host: str, prefix: str):
+            self._client = zk_connect(host)
+            self._prefix = prefix
+
+        def load(self) -> ConfigTree:
+            raw = self._client.get_recursive(self._prefix)
+            return ConfigTree.from_dict(raw)
+
+        def watch(self, callback) -> Subscription:
+            # callback(event) when the tree changes
+            ...
+
+        def close(self) -> None:
+            self._client.close()
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import type { ConfigSource, ConfigTree, Subscription } from "@dagstack/config";
+
+    export class ZookeeperSource implements ConfigSource {
+      readonly id: string;
+      constructor(private host: string, private prefix: string) {
+        this.id = `zookeeper://${host}/${prefix}`;
+      }
+      async load(): Promise<ConfigTree> { /* ... */ }
+      watch(callback: () => void): Subscription { /* ... */ }
+      close(): void { /* ... */ }
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    type ZookeeperSource struct {
+        host   string
+        prefix string
+    }
+
+    func (s *ZookeeperSource) ID() string { return fmt.Sprintf("zookeeper://%s/%s", s.host, s.prefix) }
+    func (s *ZookeeperSource) Load() (config.Tree, error) { /* ... */ }
+    func (s *ZookeeperSource) Watch(cb func()) (config.Subscription, error) { /* ... */ }
+    func (s *ZookeeperSource) Close() error { /* ... */ }
+    ```
+  </TabItem>
+</Tabs>
+
+## See also
+
+- [Configuration layers](./layers) — how YamlFileSource automatically combines three files.
+- [Environment variable substitution](./substitution) — the stage that runs after `source.load()`.
+- [Hot reload (watch)](./watch) — how sources notify the loader of changes.
+- [ADR-0001: YAML configuration](../spec/adr/0001-yaml-configuration) — the normative ConfigSource and loader contract.

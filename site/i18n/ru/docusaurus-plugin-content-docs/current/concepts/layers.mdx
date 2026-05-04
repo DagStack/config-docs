@@ -1,0 +1,225 @@
+---
+sidebar_position: 2
+title: Слои конфигурации
+description: Три слоя YamlFileSource — база + local + окружение. Порядок слияния, DAGSTACK_ENV, правила слияния объектов и массивов.
+slug: /concepts/layers
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Слои конфигурации
+
+Когда приложение вызывает `Config.load("app-config.yaml")`, загрузчик автоматически находит и сливает **три файла** в строгом порядке приоритета.
+
+## Три слоя
+
+| Слой | Файл | Коммитится в git | Назначение |
+|---|---|---|---|
+| 1. База | `app-config.yaml` | Да | Общие значения для всех окружений. |
+| 2. Local | `app-config.local.yaml` | Нет (в `.gitignore`) | Переопределения конкретного разработчика. Никогда не попадают в CI / staging / production. |
+| 3. Окружение | `app-config.${DAGSTACK_ENV}.yaml` | Да | Переопределения для конкретного окружения (production, staging, preview). |
+
+**Порядок слияния** — снизу вверх, верхний слой переопределяет нижний:
+
+```
+app-config.yaml                  (база)
+      ↓
+app-config.local.yaml            (+ переопределения разработчика, если файл есть)
+      ↓
+app-config.${DAGSTACK_ENV}.yaml  (+ переопределения окружения, если DAGSTACK_ENV задан и файл есть)
+      ↓
+     Config
+```
+
+## DAGSTACK_ENV — env-переменная с пространством имён
+
+Выбор `DAGSTACK_ENV` (а не общего `APP_ENV` / `NODE_ENV` / `RAILS_ENV`) — нормативное решение в [ADR-0001](../spec/adr/0001-yaml-configuration). Причина: в развёртываниях со смесью фреймворков dagstack-приложение может делить хост со Spring / Next / Rails. Общий `APP_ENV` тогда случайно протёк бы значениями между фреймворками.
+
+```bash
+# Production
+export DAGSTACK_ENV=production
+python main.py   # читает app-config.yaml + app-config.production.yaml
+
+# Staging
+export DAGSTACK_ENV=staging
+python main.py   # читает app-config.yaml + app-config.staging.yaml
+
+# Без DAGSTACK_ENV — только база + local (если есть)
+unset DAGSTACK_ENV
+python main.py   # читает app-config.yaml + app-config.local.yaml (если файл есть)
+```
+
+## Правила слияния
+
+### Объекты — глубокое слияние
+
+```yaml title="app-config.yaml"
+database:
+  host: "localhost"
+  port: 5432
+  pool_size: 20
+```
+
+```yaml title="app-config.production.yaml"
+database:
+  host: "prod-db.internal.example.com"
+  pool_size: 100
+```
+
+Результат при `DAGSTACK_ENV=production`:
+
+```yaml
+database:
+  host: "prod-db.internal.example.com"    # из production
+  port: 5432                              # из базы (не переопределено)
+  pool_size: 100                          # из production
+```
+
+Вложенные объекты сливаются **рекурсивно** — каждое поле на каждом уровне вычисляется независимо.
+
+### Массивы — атомарная замена
+
+```yaml title="app-config.yaml"
+dagstack:
+  plugin_dirs:
+    - plugins/
+    - examples/plugins/
+```
+
+```yaml title="app-config.production.yaml"
+dagstack:
+  plugin_dirs:
+    - /opt/dagstack/plugins/
+```
+
+Результат:
+
+```yaml
+dagstack:
+  plugin_dirs:
+    - /opt/dagstack/plugins/    # массив полностью заменён, а не объединён
+```
+
+Это намеренно ([ADR-0001](../spec/adr/0001-yaml-configuration) §3): конкатенация затрудняет предсказуемость слияния; приложение, которое хочет «добавить» элемент, обязано выписать массив целиком.
+
+### Null в слое-переопределении
+
+```yaml title="app-config.yaml"
+cache:
+  redis:
+    url: "redis://localhost:6379/0"
+    ttl_min: 15
+```
+
+```yaml title="app-config.local.yaml"
+cache:
+  redis: null    # отключить кеш для локальной разработки
+```
+
+Результат: `cache.redis = null` (весь объект исчезает). Это не то же самое, что просто опустить `redis` в файле-переопределении — это оставило бы базовое значение нетронутым.
+
+## Типичные раскладки
+
+### Минимум
+
+```
+app-config.yaml                  # всё, что нужно для dev
+# local / env пока не нужны
+```
+
+### Dev + production
+
+```
+app-config.yaml                  # общие значения
+app-config.local.yaml            # переопределения разработчика (gitignored)
+app-config.production.yaml       # production-развёртывание
+```
+
+### Полный набор окружений
+
+```
+app-config.yaml
+app-config.local.yaml            # у каждого разработчика свой
+app-config.development.yaml      # переопределения общего dev-кластера
+app-config.staging.yaml
+app-config.production.yaml
+app-config.preview.yaml          # preview-окружения для PR
+```
+
+## Явное перечисление слоёв
+
+Когда автоматический поиск не подходит (например, тесты с нестандартными путями), используй `load_paths` / `loadFrom(YamlFileSource[])` / `LoadFrom`:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    config = Config.load_paths([
+        "config/base.yaml",
+        "config/integration-test.yaml",
+        "config/secrets-ci.yaml",
+    ])
+    # Логика DAGSTACK_ENV не применяется; порядок задаёт приоритет.
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { Config, YamlFileSource } from "@dagstack/config";
+
+    const config = await Config.loadFrom([
+      new YamlFileSource("config/base.yaml"),
+      new YamlFileSource("config/integration-test.yaml"),
+      new YamlFileSource("config/secrets-ci.yaml"),
+    ]);
+    // Порядок задаёт приоритет; DAGSTACK_ENV не применяется.
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    cfg, err := config.LoadFrom(context.Background(), []config.Source{
+        config.NewYamlFileSource("config/base.yaml"),
+        config.NewYamlFileSource("config/integration-test.yaml"),
+        config.NewYamlFileSource("config/secrets-ci.yaml"),
+    })
+    // Порядок задаёт приоритет; DAGSTACK_ENV не применяется.
+    ```
+  </TabItem>
+</Tabs>
+
+## Как узнать, какие слои применились
+
+Для диагностики метод `source_ids` / `sourceIds` / `SourceIds` возвращает список идентификаторов источников в порядке их загрузки:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    print(config.source_ids())
+    # → ["yaml:app-config.yaml", "yaml:app-config.local.yaml",
+    #    "yaml:app-config.production.yaml"]
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    console.log(config.sourceIds());
+    // → ["yaml:app-config.yaml", "yaml:app-config.local.yaml",
+    //    "yaml:app-config.production.yaml"]
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    fmt.Println(cfg.SourceIDs())
+    // → [yaml:app-config.yaml yaml:app-config.local.yaml
+    //    yaml:app-config.production.yaml]
+    ```
+  </TabItem>
+</Tabs>
+
+:::note Трассировка по конкретному пути — Phase 2+
+Метод вида `config.trace("database.host")` (показывающий, из какого файла и из какой строки пришло конкретное значение) **не реализован** ни в одном биндинге в v0.1 / v0.2. Для отладки «почему значение не такое, как я ожидал» используй `snapshot()` и сравнивай с отдельно загруженными слоями.
+:::
+
+## См. также
+
+- [Источники (ConfigSource)](./sources) — как YamlFileSource вписывается в общую картину.
+- [Подстановка переменных окружения](./substitution) — интерполяция работает одинаково в каждом слое.
+- [ADR-0001 §3 Слои конфигурации и слияние](../spec/adr/0001-yaml-configuration) — нормативные правила.

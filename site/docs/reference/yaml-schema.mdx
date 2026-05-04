@@ -1,0 +1,220 @@
+---
+sidebar_position: 1
+title: YAML structure
+description: Conventions for the structure of app-config.yaml — standard top-level sections, naming rules, examples for typical dagstack applications.
+slug: /reference/yaml-schema
+---
+
+# `app-config.yaml` structure
+
+The normative specification does not pin down which sections must exist — every top-level section is defined by the consuming application. Below are the **conventions** for naming and structuring the file that have emerged across the dagstack ecosystem.
+
+## Common top-level sections
+
+A set of sections that show up in most dagstack applications regardless of domain (billing, analytics, chatbot, indexer, notification service, and so on):
+
+| Section | Purpose | Required |
+|---|---|---|
+| `app` | Application metadata (name, tagline). | No, but recommended. |
+| `dagstack` | plugin-system settings (`plugin_dirs`, overrides). | If you use plugin-system. |
+| `logging` | Structured logger ([dagstack/logger-spec](https://github.com/dagstack/logger-spec)). | Recommended. |
+| `tenancy` | Multi-tenancy model ([dagstack/tenancy-spec](https://github.com/dagstack/tenancy-spec)). | If multi-tenant. |
+| `database` | Database connection (host, port, pool_size). | Domain-specific. |
+| `cache` | Redis / memcached / local cache. | Domain-specific. |
+| `metrics` | Prometheus / OTLP endpoint. | Recommended in production. |
+| `<kind>.<name>` | The section of a specific plugin of kind `kind` named `name`. | plugin-system apps. |
+
+Everything else is a domain-specific section dictated by the application (`billing`, `notifications`, `workers`, `auth`, `rag`, `email`, `scheduler`, `api`, and so on).
+
+## Naming conventions
+
+| Rule | Example |
+|---|---|
+| `snake_case` for keys | `base_url`, `max_retries` |
+| Singular noun | `database`, not `databases` |
+| Booleans without `is_` / `has_` | `enabled`, not `is_enabled` |
+| Timestamps in ISO 8601 | `"2026-04-21T12:00:00Z"` |
+| Durations with `_s` / `_ms` / `_min` suffix | `timeout_s: 30`, `cache_ttl_min: 15` |
+| Sizes with `_bytes` / `_mb` / `_gb` suffix | `max_upload_mb: 10` |
+
+## Example: service backend
+
+```yaml title="app-config.yaml"
+app:
+  name: "order-service"
+  tagline: "Order processor"
+
+dagstack:
+  plugin_dirs:
+    - plugins/
+
+database:
+  host: "${DB_HOST:-localhost}"
+  port: "${DB_PORT:-5432}"
+  name: "${DB_NAME:-orders}"
+  user: "${DB_USER}"
+  password: "${DB_PASSWORD}"
+  pool_size: 20
+
+cache:
+  url: "${REDIS_URL:-redis://localhost:6379/0}"
+  ttl_min: 15
+
+api:
+  host: "0.0.0.0"
+  port: 8080
+  cors_origins:
+    - "https://app.example.com"
+
+workers:
+  concurrency: 8
+  queue_name: "orders"
+
+logging:
+  level: "${LOG_LEVEL:-INFO}"
+  format: "${LOG_FORMAT:-json}"
+
+tenancy:
+  mode: "${TENANCY_MODE:-single}"
+```
+
+## Example: data-processing application with plugin-system
+
+```yaml title="app-config.yaml"
+app:
+  name: "data-indexer"
+
+dagstack:
+  plugin_dirs:
+    - plugins/
+
+# Sections of specific plugins follow the rule <kind>.<name>:
+
+source:
+  s3_bucket:                            # section for the source.s3_bucket plugin
+    bucket: "${INGEST_BUCKET}"
+    region: "eu-central-1"
+  postgres:                             # section for the source.postgres plugin
+    url: "${SOURCE_DB_URL}"
+
+processor:
+  normalize:                            # section for the processor.normalize plugin
+    locale: "en_US"
+  enrich:                               # section for the processor.enrich plugin
+    api_key: "${ENRICHMENT_API_KEY}"
+
+sink:
+  elasticsearch:                        # section for the sink.elasticsearch plugin
+    url: "${ES_URL}"
+    index: "documents"
+```
+
+Each plugin reads **its own** `<kind>.<name>` section through `config.getSection()` — a shared pattern regardless of the application's domain.
+
+## Domain-specific examples
+
+dagstack works equally well for different classes of applications — a few typical configs:
+
+**E-commerce billing** (payment processing):
+
+```yaml
+billing:
+  provider: "${BILLING_PROVIDER:-stripe}"
+  webhook_secret: "${BILLING_WEBHOOK_SECRET}"
+  currency: "USD"
+  tax_rates:
+    default: 0.20
+    reduced: 0.05
+```
+
+**Notification aggregator**:
+
+```yaml
+notifications:
+  email:
+    smtp_host: "${SMTP_HOST}"
+    from_address: "no-reply@example.com"
+  sms:
+    api_key: "${SMS_API_KEY}"
+    from_number: "+1-555-0100"
+  push:
+    fcm_key: "${FCM_KEY}"
+```
+
+**AI / RAG platform** (one of many possible shapes):
+
+```yaml
+llm:
+  base_url: "${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+  api_key: "${OPENAI_API_KEY}"
+  model: "${OPENAI_MODEL:-gpt-4o-mini}"
+
+vector_store:
+  url: "${QDRANT_URL:-http://localhost:6333}"
+  api_key: "${QDRANT_API_KEY}"
+
+retrieval:
+  top_k: 10
+  min_score: 0.55
+```
+
+In all three cases the config-stack mechanics are the same — layers, env interpolation, `getSection()`, change subscriptions. Domain-specific knowledge lives in the application, not in the config stack.
+
+## Merge rules for arrays
+
+```yaml title="app-config.yaml"
+dagstack:
+  plugin_dirs:
+    - plugins/
+    - examples/plugins/
+```
+
+```yaml title="app-config.production.yaml"
+dagstack:
+  plugin_dirs:
+    - /opt/dagstack/plugins/
+```
+
+**After the merge** (DAGSTACK_ENV=production):
+
+```yaml
+dagstack:
+  plugin_dirs:
+    - /opt/dagstack/plugins/        # the array is fully replaced
+```
+
+The array is **not concatenated**. See [Layers](../concepts/layers) for the merge rules.
+
+## Null in an override layer
+
+```yaml title="app-config.yaml"
+cache:
+  redis:
+    url: "redis://localhost:6379/0"
+```
+
+```yaml title="app-config.local.yaml"
+cache:
+  redis: null         # explicitly disable the cache locally
+```
+
+`null` in an override layer **explicitly** overrides the base value. Omitting the key from the override leaves the base alone.
+
+## Comments
+
+YAML supports `#` comments. A good practice:
+
+```yaml
+api:
+  # Maximum requests per second per client. Default is 10; for internal
+  # services you can raise it up to 100.
+  rate_limit_rps: 10
+```
+
+Comments help operators understand the purpose of non-obvious fields.
+
+## See also
+
+- [Configuration layers](../concepts/layers) — merge rules.
+- [Environment variable substitution](../concepts/substitution) — the `${VAR}` syntax.
+- [Declare a section](../guides/declaring-section) — pydantic / zod schema for your section.

@@ -1,0 +1,185 @@
+---
+sidebar_position: 3
+title: Подстановка переменных окружения
+description: Синтаксис ${VAR} / ${VAR:-default}, семантика интерполяции, обработка отсутствующих переменных, экранирование $$.
+slug: /concepts/substitution
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Подстановка переменных окружения
+
+Значения в YAML-конфигурации могут ссылаться на переменные окружения через синтаксис `${...}`. Интерполяция запускается **на этапе загрузки файла**, до слияния слоёв и до типизированного доступа.
+
+## Синтаксис
+
+```
+${VAR}              → значение переменной окружения VAR; если не задана — ConfigError
+${VAR:-default}     → значение VAR или литерал "default", если VAR не задана / пустая
+```
+
+Примеры:
+
+```yaml
+database:
+  host: "${DB_HOST:-localhost}"
+  port: "${DB_PORT:-5432}"
+  password: "${DB_PASSWORD}"
+  pool_size: "${DB_POOL_SIZE:-20}"   # пока строка; приведение типа произойдёт позже
+
+cache:
+  url: "${REDIS_URL:-redis://localhost:6379/0}"
+```
+
+## Семантика
+
+1. **Когда запускается интерполяция** — **в момент загрузки файла** (а не на каждом чтении). Если env-переменная меняется после `Config.load()`, конфигурация **не обновляется** автоматически; для горячей перезагрузки нужен `ConfigSource.watch`.
+
+2. **Результат всегда строка** — `${NUM}` даёт строку. Приведение типа (`getInt`, `getBool`) происходит при чтении, не во время интерполяции:
+
+   ```yaml
+   database:
+     pool_size: "${DB_POOL_SIZE:-20}"      # строка "20" после интерполяции
+   ```
+
+   <Tabs groupId="lang" queryString="lang">
+     <TabItem value="python" label="Python">
+       ```python
+       config.getInt("database.pool_size")      # 20 — приводится на лету
+       config.getString("database.pool_size")   # "20" — остаётся строкой
+       ```
+     </TabItem>
+     <TabItem value="typescript" label="TypeScript">
+       ```ts
+       config.getInt("database.pool_size");     // 20
+       config.getString("database.pool_size");  // "20"
+       ```
+     </TabItem>
+     <TabItem value="go" label="Go">
+       ```go
+       cfg.GetInt("database.pool_size")     // 20
+       cfg.GetString("database.pool_size")  // "20"
+       ```
+     </TabItem>
+   </Tabs>
+
+3. **Правила приведения типов** (строгие):
+   - `int`: `^-?\d+$`.
+   - `bool`: `true|false|yes|no|1|0` (без учёта регистра).
+   - `float`: стандартный парсер чисел с плавающей точкой.
+   - Если строка не подходит под тип → `ConfigError(type_mismatch)`.
+
+4. **Значения по умолчанию — литеральные строки** — вложенные `${...}` внутри части default **не** интерполируются. Это сохраняет парсер простым:
+
+   ```yaml
+   database:
+     # OK:
+     host: "${DB_HOST:-localhost}"
+     # Не работает (default — литерал):
+     password: "${DB_PASSWORD:-${FALLBACK_PASSWORD}}"   # default будет литералом "${FALLBACK_PASSWORD}"
+   ```
+
+   Если нужен двухступенчатый резерв, используй внешний скрипт / shell-exec или обработай это в коде приложения.
+
+5. **Экранирование литерального `$`** — `$$` → `$`. Полезно, когда нужен буквально символ `$`:
+
+   ```yaml
+   billing:
+     price_prefix: "$$"    # литерал "$"
+   ```
+
+## Отсутствующая env-переменная без default
+
+```yaml
+database:
+  password: "${DB_PASSWORD}"   # без default
+```
+
+Если `DB_PASSWORD` не задана в окружении, `Config.load` бросает `ConfigError`:
+
+```
+ConfigError(
+  path="database.password",
+  reason="env_unresolved",
+  details="Environment variable DB_PASSWORD is not set and no default provided",
+)
+```
+
+Приложение получает явную ошибку при старте — пароль **не** подменяется молча на пустую строку, что привело бы к рантайм-сюрпризу «authentication failed».
+
+## Где задавать env-переменные
+
+**Локальная разработка:** файл `.env`, который подхватывается инструментом (`direnv` / `dotenv`):
+
+```dotenv title=".env (gitignored)"
+DB_HOST=localhost
+DB_PASSWORD=local-dev-pw
+REDIS_URL=redis://localhost:6379/0
+DAGSTACK_ENV=
+```
+
+**Docker / production:** через `env:` в `docker-compose.yml` / `kubernetes/deployment.yaml`.
+
+**CI:** через механизм секретов CI-системы (GitHub Actions Secrets / Gitea Secrets).
+
+dagstack/config **не** читает `.env`-файлы сам — это ответственность того, кто запускает процесс (Python `python-dotenv`, Node `dotenv`, `direnv` и так далее). К моменту старта приложения переменные уже доступны в `os.environ` / `process.env`.
+
+## Подстановка между слоями
+
+Интерполяция env запускается **независимо для каждого слоя-файла**. Результат: разные слои могут ссылаться на разные env-переменные, и слияние работает уже над интерполированными значениями.
+
+```yaml title="app-config.yaml (база)"
+database:
+  password: "${DB_PASSWORD}"
+```
+
+```yaml title="app-config.production.yaml"
+database:
+  password: "${DB_PASSWORD_PRODUCTION}"   # отдельная env-переменная в prod
+```
+
+При `DAGSTACK_ENV=production`:
+
+1. Загружается базовый слой → `${DB_PASSWORD}` → `"local-pw"` из окружения.
+2. Загружается production-слой → `${DB_PASSWORD_PRODUCTION}` → `"prod-pw"`.
+3. Слияние: значение production побеждает → `password: "prod-pw"`.
+
+## Типичные антипаттерны
+
+```yaml
+# ✗ Слишком много магии — приложение зависит от конкретных env-переменных:
+feature_flags:
+  new_ui_enabled: "${NEW_UI_ENABLED:-true}"       # зачем env-переопределение для каждого флага?
+
+# ✓ Лучше — базовое значение в YAML, переопределение через app-config.${ENV}.yaml:
+feature_flags:
+  new_ui_enabled: true
+```
+
+```yaml
+# ✗ Секрет с placeholder-значением по умолчанию:
+database:
+  password: "${DB_PASSWORD:-admin123}"    # в prod без env сработает default (опасно!)
+
+# ✓ Без default — явная ошибка при старте, если забыл env:
+database:
+  password: "${DB_PASSWORD}"
+```
+
+```yaml
+# ✗ Default содержит env-переменную (она не интерполируется):
+database:
+  url: "${DATABASE_URL:-postgresql://user:${DB_PASSWORD}@localhost/dev}"
+
+# ✓ Отдельная env-переменная или сборка URL в коде приложения:
+database:
+  url: "${DATABASE_URL}"
+  # Собирай URL из частей в приложении, а не в YAML.
+```
+
+## См. также
+
+- [Секреты](./secrets) — env как основной канал для секретов.
+- [Слои конфигурации](./layers) — подстановка env внутри каждого слоя.
+- [ADR-0001 §2 Синтаксис интерполяции env](../spec/adr/0001-yaml-configuration) — нормативный контракт.

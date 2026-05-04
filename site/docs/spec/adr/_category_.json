@@ -1,0 +1,11 @@
+{
+  "label": "ADR",
+  "position": 2,
+  "collapsible": true,
+  "collapsed": false,
+  "link": {
+    "type": "generated-index",
+    "title": "ADR (Architecture Decision Records)",
+    "description": "Architectural decisions for dagstack/config-spec, captured as ADRs — a concise synopsis with a link to the full normative text in the spec repository."
+  }
+}

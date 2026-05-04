@@ -1,0 +1,43 @@
+---
+sidebar_position: 1
+title: What the specification is
+description: The role of dagstack/config-spec — a language-agnostic configuration contract for every dagstack subsystem. How ADRs differ from guides.
+slug: /spec/overview
+---
+
+# What the specification is
+
+`dagstack/config-spec` is the normative source of truth for configuration in the dagstack ecosystem. It pins down **what** must hold in any implementation (`dagstack/config-python`, `dagstack/config-typescript`, the planned `dagstack/config-go`) — and **why** that choice was made.
+
+## How the "Specification" section differs from the guides
+
+| Section | Audience | What it gives you |
+|---|---|---|
+| [Concepts](../concepts/sources) | Application developer | Explains **how** the configuration works today, in terms of a specific language. |
+| [Guides](../guides/declaring-section) | Application developer | Walks through a task step by step. |
+| **Specification** (this section) | Implementation author / reviewer | Explains **why** a decision was made; pins down normative guarantees. |
+
+## ADRs
+
+As of v1.0, one ADR is in place:
+
+1. **[ADR-0001: YAML configuration with env interpolation](./adr/0001-yaml-configuration)** — transport format, layers, env interpolation, the ConfigSource abstraction, the error model, subscriptions, canonical JSON, and specification artifacts.
+
+Additional ADRs will appear as the ecosystem matures (composite profiles, parameterized overrides, validation webhooks, and so on).
+
+## The normative source
+
+The pages in this section are a **descriptive prose summary** of the ADRs. The formal normative text lives in [`dagstack/config-spec`](https://github.com/dagstack/config-spec/tree/main/adr). If you are working on changes inside an implementation, read the normative version: it covers every edge case, the serialization rules, and the requirements on error messages.
+
+## How the specification changes
+
+1. Open an issue in [`dagstack/config-spec`](https://github.com/dagstack/config-spec/issues).
+2. Submit a PR with a new ADR or a revision of an existing one.
+3. Architect review plus sign-off from the maintainers of every implementation (each implementation must confirm that it can ship the change).
+4. After merge, update the implementations and refresh the summary in this section.
+
+## Related specifications
+
+- [`dagstack/plugin-system-spec`](https://github.com/dagstack/plugin-system-spec) — the plugin system reads plugin sections through the config stack.
+- [`dagstack/logger-spec`](https://github.com/dagstack/logger-spec) — the logger reads its section from the config.
+- [`dagstack/tenancy-spec`](https://github.com/dagstack/tenancy-spec) — the tenancy model is configured through the config.

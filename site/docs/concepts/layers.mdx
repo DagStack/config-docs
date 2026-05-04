@@ -1,0 +1,230 @@
+---
+sidebar_position: 2
+title: Configuration layers
+description: The three YamlFileSource layers — base + local + environment-specific. Merge order, DAGSTACK_ENV, merge rules for objects and arrays.
+slug: /concepts/layers
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Configuration layers
+
+When an application calls `Config.load("app-config.yaml")`, the loader automatically discovers and merges **three files** in a strict priority order.
+
+## The three layers
+
+| Layer | File | Committed to git | Purpose |
+|---|---|---|---|
+| 1. Base | `app-config.yaml` | Yes | Common values for all environments. |
+| 2. Local | `app-config.local.yaml` | No (in `.gitignore`) | Developer-specific overrides. Never reaches CI/staging/production. |
+| 3. Environment | `app-config.${DAGSTACK_ENV}.yaml` | Yes | Overrides for a specific environment (production, staging, preview). |
+
+**Merge order** is bottom-up — a higher layer overrides a lower one:
+
+```
+app-config.yaml                  (base)
+      ↓
+app-config.local.yaml            (+ developer overrides, if the file exists)
+      ↓
+app-config.${DAGSTACK_ENV}.yaml  (+ environment overrides, if DAGSTACK_ENV is set and the file exists)
+      ↓
+     Config
+```
+
+## DAGSTACK_ENV — a namespaced environment variable
+
+The choice of `DAGSTACK_ENV` (rather than a generic `APP_ENV` / `NODE_ENV` / `RAILS_ENV`) is a normative decision in [ADR-0001](../spec/adr/0001-yaml-configuration). The reason: in mixed-framework deployments a dagstack application may share a host with Spring / Next / Rails. A common `APP_ENV` would then accidentally bleed values across frameworks.
+
+```bash
+# Production
+export DAGSTACK_ENV=production
+python main.py   # loads app-config.yaml + app-config.production.yaml
+
+# Staging
+export DAGSTACK_ENV=staging
+python main.py   # loads app-config.yaml + app-config.staging.yaml
+
+# Without DAGSTACK_ENV — only base + local (if it exists)
+unset DAGSTACK_ENV
+python main.py   # loads app-config.yaml + app-config.local.yaml (if it exists)
+```
+
+## Merge rules
+
+### Objects — deep merge
+
+```yaml title="app-config.yaml"
+database:
+  host: "localhost"
+  port: 5432
+  pool_size: 20
+```
+
+```yaml title="app-config.production.yaml"
+database:
+  host: "prod-db.internal.example.com"
+  pool_size: 100
+```
+
+The result with `DAGSTACK_ENV=production`:
+
+```yaml
+database:
+  host: "prod-db.internal.example.com"    # from production
+  port: 5432                              # from base (not overridden)
+  pool_size: 100                          # from production
+```
+
+Nested objects are merged **recursively** — every field at every level is computed independently.
+
+### Arrays — atomic replacement
+
+```yaml title="app-config.yaml"
+dagstack:
+  plugin_dirs:
+    - plugins/
+    - examples/plugins/
+```
+
+```yaml title="app-config.production.yaml"
+dagstack:
+  plugin_dirs:
+    - /opt/dagstack/plugins/
+```
+
+The result:
+
+```yaml
+dagstack:
+  plugin_dirs:
+    - /opt/dagstack/plugins/    # the array is fully replaced, not concatenated
+```
+
+This is intentional ([ADR-0001](../spec/adr/0001-yaml-configuration) §3): concatenation makes merge predictability difficult; an application that wants to "add" an element must spell out the full array.
+
+### Null in an override layer
+
+```yaml title="app-config.yaml"
+cache:
+  redis:
+    url: "redis://localhost:6379/0"
+    ttl_min: 15
+```
+
+```yaml title="app-config.local.yaml"
+cache:
+  redis: null    # disable the cache for local development
+```
+
+The result: `cache.redis = null` (the entire object disappears). This is not the same as omitting `redis` from the override file — that simply leaves the base value untouched.
+
+## Typical layouts
+
+### Minimum
+
+```
+app-config.yaml                  # everything you need in dev
+# local / env not yet needed
+```
+
+### Dev + production
+
+```
+app-config.yaml                  # shared
+app-config.local.yaml            # developer overrides (gitignored)
+app-config.production.yaml       # production deployment
+```
+
+### Full set of environments
+
+```
+app-config.yaml
+app-config.local.yaml            # each developer keeps their own
+app-config.development.yaml      # shared dev-cluster overrides
+app-config.staging.yaml
+app-config.production.yaml
+app-config.preview.yaml          # preview environments for PRs
+```
+
+## Listing layers explicitly
+
+When auto-discovery does not fit (for example, tests with non-standard paths),
+use `load_paths` / `loadFrom(YamlFileSource[])` / `LoadFrom`:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    config = Config.load_paths([
+        "config/base.yaml",
+        "config/integration-test.yaml",
+        "config/secrets-ci.yaml",
+    ])
+    # No DAGSTACK_ENV logic; order defines priority.
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { Config, YamlFileSource } from "@dagstack/config";
+
+    const config = await Config.loadFrom([
+      new YamlFileSource("config/base.yaml"),
+      new YamlFileSource("config/integration-test.yaml"),
+      new YamlFileSource("config/secrets-ci.yaml"),
+    ]);
+    // Order defines priority; DAGSTACK_ENV does not apply.
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    cfg, err := config.LoadFrom(context.Background(), []config.Source{
+        config.NewYamlFileSource("config/base.yaml"),
+        config.NewYamlFileSource("config/integration-test.yaml"),
+        config.NewYamlFileSource("config/secrets-ci.yaml"),
+    })
+    // Order defines priority; DAGSTACK_ENV does not apply.
+    ```
+  </TabItem>
+</Tabs>
+
+## How to find out which layers were applied
+
+For diagnostics, the `source_ids` / `sourceIds` / `SourceIds` method returns
+a list of source identifiers in the order they were loaded:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    print(config.source_ids())
+    # → ["yaml:app-config.yaml", "yaml:app-config.local.yaml",
+    #    "yaml:app-config.production.yaml"]
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    console.log(config.sourceIds());
+    // → ["yaml:app-config.yaml", "yaml:app-config.local.yaml",
+    //    "yaml:app-config.production.yaml"]
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    fmt.Println(cfg.SourceIDs())
+    // → [yaml:app-config.yaml yaml:app-config.local.yaml
+    //    yaml:app-config.production.yaml]
+    ```
+  </TabItem>
+</Tabs>
+
+:::note Per-path source trace — Phase 2+
+A method like `config.trace("database.host")` (showing which file and which
+line a particular value came from) is **not implemented** in any binding in
+v0.1 / v0.2. To debug "why is the value not what I expected", use
+`snapshot()` and compare against the layers loaded individually.
+:::
+
+## See also
+
+- [Sources (ConfigSource)](./sources) — how YamlFileSource fits into the bigger picture.
+- [Environment variable substitution](./substitution) — interpolation works the same way in every layer.
+- [ADR-0001 §3 Config layering and merge](../spec/adr/0001-yaml-configuration) — the normative rules.

@@ -1,0 +1,220 @@
+---
+sidebar_position: 1
+title: Структура YAML
+description: Соглашения по структуре app-config.yaml — стандартные секции верхнего уровня, правила именования, примеры для типичных dagstack-приложений.
+slug: /reference/yaml-schema
+---
+
+# Структура `app-config.yaml`
+
+Нормативная спецификация не фиксирует, какие секции обязательны — каждая секция верхнего уровня определяется потребляющим приложением. Ниже — **соглашения** по именованию и структуре файла, сложившиеся в экосистеме dagstack.
+
+## Типичные секции верхнего уровня
+
+Набор секций, который встречается в большинстве dagstack-приложений независимо от предметной области (биллинг, аналитика, чат-бот, индексер, сервис уведомлений и так далее):
+
+| Секция | Назначение | Обязательна |
+|---|---|---|
+| `app` | Метаданные приложения (name, tagline). | Нет, но рекомендуется. |
+| `dagstack` | Настройки plugin-system (`plugin_dirs`, переопределения). | Если используешь plugin-system. |
+| `logging` | Структурированный логгер ([dagstack/logger-spec](https://github.com/dagstack/logger-spec)). | Рекомендуется. |
+| `tenancy` | Модель мультитенантности ([dagstack/tenancy-spec](https://github.com/dagstack/tenancy-spec)). | Если приложение мультитенантное. |
+| `database` | Подключение к БД (host, port, pool_size). | Зависит от предметной области. |
+| `cache` | Redis / memcached / локальный кеш. | Зависит от предметной области. |
+| `metrics` | Prometheus / OTLP-эндпоинт. | Рекомендуется в production. |
+| `<kind>.<name>` | Секция конкретного плагина типа `kind` с именем `name`. | Для приложений на plugin-system. |
+
+Всё остальное — секции конкретной предметной области, продиктованные приложением (`billing`, `notifications`, `workers`, `auth`, `rag`, `email`, `scheduler`, `api` и так далее).
+
+## Соглашения по именованию
+
+| Правило | Пример |
+|---|---|
+| `snake_case` для ключей | `base_url`, `max_retries` |
+| Существительное в единственном числе | `database`, не `databases` |
+| Булевы поля без `is_` / `has_` | `enabled`, не `is_enabled` |
+| Метки времени в ISO 8601 | `"2026-04-21T12:00:00Z"` |
+| Длительности с суффиксом `_s` / `_ms` / `_min` | `timeout_s: 30`, `cache_ttl_min: 15` |
+| Размеры с суффиксом `_bytes` / `_mb` / `_gb` | `max_upload_mb: 10` |
+
+## Пример: бэкенд-сервис
+
+```yaml title="app-config.yaml"
+app:
+  name: "order-service"
+  tagline: "Order processor"
+
+dagstack:
+  plugin_dirs:
+    - plugins/
+
+database:
+  host: "${DB_HOST:-localhost}"
+  port: "${DB_PORT:-5432}"
+  name: "${DB_NAME:-orders}"
+  user: "${DB_USER}"
+  password: "${DB_PASSWORD}"
+  pool_size: 20
+
+cache:
+  url: "${REDIS_URL:-redis://localhost:6379/0}"
+  ttl_min: 15
+
+api:
+  host: "0.0.0.0"
+  port: 8080
+  cors_origins:
+    - "https://app.example.com"
+
+workers:
+  concurrency: 8
+  queue_name: "orders"
+
+logging:
+  level: "${LOG_LEVEL:-INFO}"
+  format: "${LOG_FORMAT:-json}"
+
+tenancy:
+  mode: "${TENANCY_MODE:-single}"
+```
+
+## Пример: приложение для обработки данных на plugin-system
+
+```yaml title="app-config.yaml"
+app:
+  name: "data-indexer"
+
+dagstack:
+  plugin_dirs:
+    - plugins/
+
+# Секции конкретных плагинов следуют правилу <kind>.<name>:
+
+source:
+  s3_bucket:                            # секция плагина source.s3_bucket
+    bucket: "${INGEST_BUCKET}"
+    region: "eu-central-1"
+  postgres:                             # секция плагина source.postgres
+    url: "${SOURCE_DB_URL}"
+
+processor:
+  normalize:                            # секция плагина processor.normalize
+    locale: "en_US"
+  enrich:                               # секция плагина processor.enrich
+    api_key: "${ENRICHMENT_API_KEY}"
+
+sink:
+  elasticsearch:                        # секция плагина sink.elasticsearch
+    url: "${ES_URL}"
+    index: "documents"
+```
+
+Каждый плагин читает **свою** секцию `<kind>.<name>` через `config.getSection()` — общий паттерн независимо от предметной области приложения.
+
+## Примеры по предметным областям
+
+dagstack одинаково хорошо подходит для разных классов приложений — пара типичных конфигов:
+
+**E-commerce биллинг** (обработка платежей):
+
+```yaml
+billing:
+  provider: "${BILLING_PROVIDER:-stripe}"
+  webhook_secret: "${BILLING_WEBHOOK_SECRET}"
+  currency: "USD"
+  tax_rates:
+    default: 0.20
+    reduced: 0.05
+```
+
+**Агрегатор уведомлений**:
+
+```yaml
+notifications:
+  email:
+    smtp_host: "${SMTP_HOST}"
+    from_address: "no-reply@example.com"
+  sms:
+    api_key: "${SMS_API_KEY}"
+    from_number: "+1-555-0100"
+  push:
+    fcm_key: "${FCM_KEY}"
+```
+
+**AI- / RAG-платформа** (одна из возможных компоновок):
+
+```yaml
+llm:
+  base_url: "${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+  api_key: "${OPENAI_API_KEY}"
+  model: "${OPENAI_MODEL:-gpt-4o-mini}"
+
+vector_store:
+  url: "${QDRANT_URL:-http://localhost:6333}"
+  api_key: "${QDRANT_API_KEY}"
+
+retrieval:
+  top_k: 10
+  min_score: 0.55
+```
+
+Во всех трёх случаях механика стека одинакова — слои, интерполяция env, `getSection()`, подписки на изменения. Знание предметной области остаётся в приложении, а не в стеке конфигурации.
+
+## Правила слияния массивов
+
+```yaml title="app-config.yaml"
+dagstack:
+  plugin_dirs:
+    - plugins/
+    - examples/plugins/
+```
+
+```yaml title="app-config.production.yaml"
+dagstack:
+  plugin_dirs:
+    - /opt/dagstack/plugins/
+```
+
+**После слияния** (DAGSTACK_ENV=production):
+
+```yaml
+dagstack:
+  plugin_dirs:
+    - /opt/dagstack/plugins/        # массив полностью заменён
+```
+
+Массив **не объединяется**. Правила слияния — на странице [Слои](../concepts/layers).
+
+## Null в слое-переопределении
+
+```yaml title="app-config.yaml"
+cache:
+  redis:
+    url: "redis://localhost:6379/0"
+```
+
+```yaml title="app-config.local.yaml"
+cache:
+  redis: null         # явно отключить кеш локально
+```
+
+`null` в слое-переопределении **явно** перебивает базовое значение. Если ключ из переопределения убран, базовое значение сохраняется.
+
+## Комментарии
+
+YAML поддерживает комментарии через `#`. Хорошая практика:
+
+```yaml
+api:
+  # Максимум запросов в секунду на клиента. По умолчанию 10; для внутренних
+  # сервисов можно поднять до 100.
+  rate_limit_rps: 10
+```
+
+Комментарии помогают оператору понять назначение неочевидных полей.
+
+## См. также
+
+- [Слои конфигурации](../concepts/layers) — правила слияния.
+- [Подстановка переменных окружения](../concepts/substitution) — синтаксис `${VAR}`.
+- [Объявление секции](../guides/declaring-section) — pydantic / zod-схема для своей секции.

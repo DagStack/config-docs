@@ -1,0 +1,177 @@
+---
+sidebar_position: 1
+title: Источники (ConfigSource)
+description: Абстракция ConfigSource — откуда берётся конфигурация. YAML-файлы, env, будущие адаптеры для etcd / Consul / Vault / HTTP / SQL / K8s.
+slug: /concepts/sources
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Источники конфигурации
+
+`ConfigSource` — абстракция над местом, откуда читается конфигурация. В Phase 1 основной источник — `YamlFileSource` (файлы на диске), но API спроектирован под расширение. В Phase 2+ появятся адаптеры к централизованным хранилищам конфигурации:
+
+| Источник | Пример | Статус |
+|---|---|---|
+| `YamlFileSource` | `app-config.yaml` на диске | **Phase 1 (по умолчанию)** |
+| `JsonFileSource` | `app-config.json` на диске | **Phase 1** |
+| `InMemorySource` (Python/TS) / `DictSource` (Go) | словарь, собранный в коде — для тестов | **Phase 1** |
+| Интерполяция env `${VAR}` | читает окружение во время обработки сырого текста | **Phase 1** (встроена, не отдельный источник) |
+| `EtcdSource` | ключи в etcd под префиксом | Phase 2 (в плане) |
+| `ConsulSource` | KV-хранилище в Consul | Phase 2 (в плане) |
+| `VaultSource` | секреты в HashiCorp Vault | Phase 2 (в плане) |
+| `HttpSource` | REST-эндпоинт, отдающий JSON | Phase 2 (в плане) |
+| `SqlSource` | таблица в БД с конфигурацией, меняющейся в рантайме | Phase 2 (в плане) |
+| `KubernetesSource` | ConfigMap + Secret в Kubernetes | Phase 2 (в плане) |
+
+## Интерфейс
+
+Каждый источник реализует минимальный контракт:
+
+```
+id:                     string                              # уникальный идентификатор источника (например, "yaml:/app/config.yaml")
+load():                 ConfigTree                           # одноразовая загрузка (обязательно)
+watch?(callback):       Subscription                         # подписка на изменения (опционально)
+close?():               void                                 # освобождение ресурсов (опционально)
+```
+
+`load()` возвращает **ConfigTree** — дерево значений, которое загрузчик дальше сливает с другими источниками и прогоняет через интерполяцию env.
+
+`watch(callback)` опционален. Если источник умеет следить за изменениями (файл через fsnotify; etcd через gRPC-стрим; Kubernetes через informer), загрузчик передаёт callback, который вызывается при обнаружении изменения. Если источник этого не умеет, метод опускается; подписки на изменения всё равно регистрируются, но активируются с `active = false`.
+
+## Сценарий по умолчанию — YamlFileSource
+
+Для большинства dagstack-приложений `Config.load(path)` — это высокоуровневая обёртка над `Config.loadFrom([YamlFileSource(path), ...])`. Она автоматически находит и подключает три слоя:
+
+1. `app-config.yaml` — база (коммитится).
+2. `app-config.local.yaml` — переопределения разработчика (gitignored).
+3. `app-config.${DAGSTACK_ENV}.yaml` — переопределения окружения (коммитится).
+
+Механика слоёв описана на странице [Слои](./layers).
+
+## Явное перечисление источников
+
+Когда нужен нестандартный порядок (например, в тестах) или микс типов источников, используй `Config.loadFrom`:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.config import Config, YamlFileSource, InMemorySource
+
+    config = Config.load_from([
+        YamlFileSource("app-config.yaml"),
+        InMemorySource({"database": {"pool_size": 5}}),    # тестовое переопределение
+    ])
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { Config, YamlFileSource, InMemorySource } from "@dagstack/config";
+
+    const config = await Config.loadFrom([
+      new YamlFileSource("app-config.yaml"),
+      new InMemorySource({ database: { pool_size: 5 } }),
+    ]);
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    cfg, err := config.LoadFrom(context.Background(), []config.Source{
+        config.NewYamlFileSource("app-config.yaml"),
+        config.NewDictSource(config.Tree{"database": map[string]any{"pool_size": 5}}),
+    })
+    ```
+  </TabItem>
+</Tabs>
+
+:::note Имя in-memory-источника
+В Python и TypeScript источник называется `InMemorySource`; в Go — `DictSource`. Это историческое расхождение между биндингами; семантика идентична (дерево в памяти, без интерполяции по умолчанию).
+:::
+
+**Порядок аргументов = порядок приоритета**. У первого источника наименьший приоритет; у последнего — наибольший (он переопределяет более ранние).
+
+## Подстановка переменных окружения
+
+Env-переменные не отдельный `ConfigSource`, а этап обработки значений в загруженном ConfigTree. Строковые значения вида `${VAR}` или `${VAR:-default}` интерполируются сразу после `source.load()`, до слияния с другими источниками.
+
+Подробности — на странице [Подстановка переменных окружения](./substitution).
+
+## Семантика watch и горячая перезагрузка
+
+Когда приложение подписывается на изменения своей секции через `config.onSectionChange(path, callback)`, загрузчик регистрирует наблюдателя на каждом источнике, который умеет следить за изменениями:
+
+1. На каждом источнике регистрируется `source.watch(on_source_change)`.
+2. Любое изменение в источнике → загрузчик пересобирает дерево.
+3. Новая версия валидируется (если у подписанных секций есть схема).
+4. Если валидация прошла, подписчики получают новые значения.
+5. Если валидация провалена, вся перезагрузка откатывается; подписчики **не уведомляются** (атомарный откат).
+
+Если ни один источник не умеет следить за изменениями, каждая подписка регистрируется с `active = false`. Это не ошибка: приложение всё равно успешно стартует без горячей перезагрузки.
+
+Подробности — [Горячая перезагрузка (watch)](./watch).
+
+## Реализация собственного ConfigSource
+
+Контракт v1.0 фиксирует сигнатуры, но не формат хранения. Если нужен кастомный источник (например, ZooKeeper), реализуй интерфейс и передай экземпляр в `Config.loadFrom`:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.config import ConfigSource, ConfigTree, Subscription
+
+    class ZookeeperSource(ConfigSource):
+        id = "zookeeper://zk.example.com/my-app"
+
+        def __init__(self, host: str, prefix: str):
+            self._client = zk_connect(host)
+            self._prefix = prefix
+
+        def load(self) -> ConfigTree:
+            raw = self._client.get_recursive(self._prefix)
+            return ConfigTree.from_dict(raw)
+
+        def watch(self, callback) -> Subscription:
+            # callback(event) при изменении дерева
+            ...
+
+        def close(self) -> None:
+            self._client.close()
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import type { ConfigSource, ConfigTree, Subscription } from "@dagstack/config";
+
+    export class ZookeeperSource implements ConfigSource {
+      readonly id: string;
+      constructor(private host: string, private prefix: string) {
+        this.id = `zookeeper://${host}/${prefix}`;
+      }
+      async load(): Promise<ConfigTree> { /* ... */ }
+      watch(callback: () => void): Subscription { /* ... */ }
+      close(): void { /* ... */ }
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    type ZookeeperSource struct {
+        host   string
+        prefix string
+    }
+
+    func (s *ZookeeperSource) ID() string { return fmt.Sprintf("zookeeper://%s/%s", s.host, s.prefix) }
+    func (s *ZookeeperSource) Load() (config.Tree, error) { /* ... */ }
+    func (s *ZookeeperSource) Watch(cb func()) (config.Subscription, error) { /* ... */ }
+    func (s *ZookeeperSource) Close() error { /* ... */ }
+    ```
+  </TabItem>
+</Tabs>
+
+## См. также
+
+- [Слои конфигурации](./layers) — как YamlFileSource автоматически объединяет три файла.
+- [Подстановка переменных окружения](./substitution) — этап, который запускается после `source.load()`.
+- [Горячая перезагрузка (watch)](./watch) — как источники сообщают загрузчику об изменениях.
+- [ADR-0001: YAML-конфигурация](../spec/adr/0001-yaml-configuration) — нормативный контракт ConfigSource и загрузчика.

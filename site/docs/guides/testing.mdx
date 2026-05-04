@@ -1,0 +1,332 @@
+---
+sidebar_position: 2
+title: Testing
+description: Unit tests with inline configurations, mocking sections, validating hot reload, integration tests with DAGSTACK_ENV.
+slug: /guides/testing
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Testing
+
+A well-tested configuration stack requires that:
+
+1. Unit tests **do not** read files from disk.
+2. Code under test receives the configuration **programmatically**.
+3. Hot-reload behavior is exercised through controlled triggers.
+
+## Unit tests — inline configuration via an in-memory source
+
+Instead of reading `app-config.yaml`, build the configuration in the test itself.
+The name of the in-memory source differs across bindings:
+
+| Binding | Class |
+|---|---|
+| `dagstack-config` (Python) | `InMemorySource` |
+| `@dagstack/config` (TypeScript) | `InMemorySource` |
+| `go.dagstack.dev/config` (Go) | `DictSource` (constructor `NewDictSource`) |
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="tests/test_database_pool.py"
+    import pytest
+    from dagstack.config import Config, InMemorySource
+    from app.database import DatabaseConfig, DatabasePool
+
+
+    def test_pool_uses_configured_size():
+        config = Config.load_from([
+            InMemorySource({
+                "database": {
+                    "host": "localhost",
+                    "port": 5432,
+                    "name": "test",
+                    "user": "app",
+                    "password": "test-pw",
+                    "pool_size": 42,
+                },
+            }),
+        ])
+        pool = DatabasePool(config.get_section("database", DatabaseConfig))
+
+        assert pool.size == 42
+
+
+    def test_pool_rejects_invalid_host():
+        config = Config.load_from([
+            InMemorySource({
+                "database": {
+                    "host": "0.0.0.0",                  # rejected by the validator
+                    "name": "test",
+                    "user": "app",
+                    "password": "pw",
+                },
+            }),
+        ])
+        with pytest.raises(ValueError, match="host must be a concrete"):
+            config.get_section("database", DatabaseConfig)
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts title="tests/database-pool.test.ts"
+    import { describe, it, expect } from "vitest";
+    import { Config, InMemorySource } from "@dagstack/config";
+    import { DatabaseConfigSchema, DatabasePool } from "../src/database";
+
+    describe("DatabasePool", () => {
+      it("uses configured size", async () => {
+        const config = await Config.loadFrom([
+          new InMemorySource({
+            database: {
+              host: "localhost",
+              port: 5432,
+              name: "test",
+              user: "app",
+              password: "test-pw",
+              pool_size: 42,
+            },
+          }),
+        ]);
+        const pool = new DatabasePool(config.getSection("database", DatabaseConfigSchema));
+        expect(pool.size).toBe(42);
+      });
+
+      it("rejects invalid host", async () => {
+        const config = await Config.loadFrom([
+          new InMemorySource({
+            database: {
+              host: "0.0.0.0",
+              name: "test",
+              user: "app",
+              password: "pw",
+            },
+          }),
+        ]);
+        expect(() => config.getSection("database", DatabaseConfigSchema)).toThrow(
+          /host must be a concrete/,
+        );
+      });
+    });
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="internal/database_pool_test.go"
+    func TestPoolUsesConfiguredSize(t *testing.T) {
+        cfg, _ := config.LoadFrom(context.Background(), []config.Source{
+            config.NewDictSource(config.Tree{
+                "database": map[string]any{
+                    "host":      "localhost",
+                    "port":      5432,
+                    "name":      "test",
+                    "user":      "app",
+                    "password":  "test-pw",
+                    "pool_size": 42,
+                },
+            }),
+        })
+        var dbCfg DatabaseConfig
+        _ = cfg.GetSection("database", &dbCfg)
+
+        pool := NewDatabasePool(dbCfg)
+        if pool.Size != 42 {
+            t.Fatalf("expected size 42, got %v", pool.Size)
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## File-based tests in a temporary directory — `YamlFileSource` in `tmpdir`
+
+When you need to exercise the YAML parsing itself (nested defaults, env interpolation), write the YAML into a temporary directory:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    import pytest
+    from pathlib import Path
+    from dagstack.config import Config
+
+
+    @pytest.fixture
+    def app_config_yaml(tmp_path: Path, monkeypatch) -> Path:
+        # Env variables for interpolation:
+        monkeypatch.setenv("DB_PASSWORD", "test-pw")
+
+        yaml_path = tmp_path / "app-config.yaml"
+        yaml_path.write_text("""
+        database:
+          host: "${DB_HOST:-localhost}"
+          password: "${DB_PASSWORD}"
+          name: "test_db"
+          user: "app"
+          pool_size: 5
+        """)
+        return yaml_path
+
+
+    def test_env_interpolation(app_config_yaml):
+        config = Config.load(str(app_config_yaml))
+        assert config.get_string("database.password") == "test-pw"
+        assert config.get_string("database.host") == "localhost"
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { test, expect } from "vitest";
+    import * as fs from "fs/promises";
+    import * as path from "path";
+    import * as os from "os";
+    import { Config } from "@dagstack/config";
+
+    test("env interpolation", async () => {
+      const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "cfg-"));
+      await fs.writeFile(
+        path.join(tmp, "app-config.yaml"),
+        `
+        database:
+          host: "\${DB_HOST:-localhost}"
+          password: "\${DB_PASSWORD}"
+          name: "test_db"
+          user: "app"
+        `,
+      );
+
+      process.env.DB_PASSWORD = "test-pw";
+      const config = await Config.load(path.join(tmp, "app-config.yaml"));
+      expect(config.getString("database.password")).toBe("test-pw");
+    });
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    func TestEnvInterpolation(t *testing.T) {
+        dir := t.TempDir()
+        yamlPath := filepath.Join(dir, "app-config.yaml")
+        os.WriteFile(yamlPath, []byte(`
+        database:
+          host: "${DB_HOST:-localhost}"
+          password: "${DB_PASSWORD}"
+          name: "test_db"
+          user: "app"
+        `), 0644)
+
+        t.Setenv("DB_PASSWORD", "test-pw")
+        cfg, _ := config.Load(context.Background(), yamlPath)
+        got, _ := cfg.GetString("database.password")
+        if got != "test-pw" { t.Fatal(got) }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Hot reload — Phase 2
+
+:::caution Not implemented in v0.1 / v0.2
+Hot reload and change subscriptions are a **planned Phase 2 API**.
+In the current bindings (`dagstack-config` v0.2.0, `config-go` v0.1.0,
+`@dagstack/config` v0.1.0) the registration methods (`on_change` /
+`on_section_change` / `reload` in Python, `OnChange` / `OnSectionChange` /
+`Reload` in Go) **exist in the API, but the callback is never invoked**:
+`reload()` is a no-op, `on_change` returns an inactive `Subscription`.
+A mutable source (`MutableDictSource`) and atomic rollback on an invalid
+reload are part of the same Phase 2 scope.
+
+For tests in v0.1 / v0.2, use immutable configs: build a separate
+`Config` for each scenario through `load_from` / `loadFrom` / `LoadFrom`.
+:::
+
+## Integration tests with `DAGSTACK_ENV`
+
+For end-to-end scenarios where layer order matters, set `DAGSTACK_ENV`:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    def test_production_overrides_base(tmp_path, monkeypatch):
+        (tmp_path / "app-config.yaml").write_text("""
+        database:
+          pool_size: 20
+          host: "localhost"
+          name: "test"
+          user: "app"
+          password: "pw"
+        """)
+        (tmp_path / "app-config.production.yaml").write_text("""
+        database:
+          pool_size: 100
+        """)
+
+        monkeypatch.setenv("DAGSTACK_ENV", "production")
+        monkeypatch.chdir(tmp_path)
+        config = Config.load("app-config.yaml")
+        assert config.get_int("database.pool_size") == 100
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    test("production layer overrides base", async () => {
+      const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "cfg-"));
+      await fs.writeFile(path.join(tmp, "app-config.yaml"),
+        "database:\n  pool_size: 20\n  host: 'localhost'\n  name: 'test'\n  user: 'app'\n  password: 'pw'\n");
+      await fs.writeFile(path.join(tmp, "app-config.production.yaml"),
+        "database:\n  pool_size: 100\n");
+
+      process.env.DAGSTACK_ENV = "production";
+      const config = await Config.load(path.join(tmp, "app-config.yaml"));
+      expect(config.getInt("database.pool_size")).toBe(100);
+    });
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    func TestProductionOverridesBase(t *testing.T) {
+        dir := t.TempDir()
+        os.WriteFile(filepath.Join(dir, "app-config.yaml"), []byte(`
+database:
+  pool_size: 20
+  host: "localhost"
+  name: "test"
+  user: "app"
+  password: "pw"
+`), 0644)
+        os.WriteFile(filepath.Join(dir, "app-config.production.yaml"), []byte(`
+database:
+  pool_size: 100
+`), 0644)
+
+        t.Setenv("DAGSTACK_ENV", "production")
+        cfg, _ := config.Load(context.Background(), filepath.Join(dir, "app-config.yaml"))
+        got, _ := cfg.GetInt("database.pool_size")
+        if got != 100 {
+            t.Fatalf("expected 100, got %d", got)
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Running in CI
+
+```yaml title=".gitea/workflows/config-tests.yml"
+name: Config tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: dagstack-runner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install -e '.[test]'
+      - run: pytest tests/ -v
+```
+
+## See also
+
+- [Declare a section](./declaring-section) — building the schema.
+- [Hot reload (watch)](../concepts/watch) — subscriptions in production.
+- [Sources (ConfigSource)](../concepts/sources) — `YamlFileSource`, `JsonFileSource`, `InMemorySource` (Python/TS) / `DictSource` (Go).

@@ -1,0 +1,372 @@
+---
+sidebar_position: 2
+title: Таксономия ошибок
+description: ConfigError и его семь значений reason — missing, type_mismatch, env_unresolved, validation_failed, parse_error, source_unavailable, reload_rejected.
+slug: /reference/errors
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Таксономия ошибок
+
+Любая ошибка из стека конфигурации — это `ConfigError` с одним из семи нормативно зафиксированных значений `reason`. Структура одинакова во всех биндингах:
+
+```
+ConfigError {
+  path:        string               # точечная нотация (database.host)
+  reason:      ConfigErrorReason    # enum
+  details:     string               # человекочитаемое сообщение
+  source_id?:  string               # yaml:/app-config.yaml и так далее
+}
+```
+
+## Полный enum `ConfigErrorReason`
+
+Нормативный источник — [`config-spec/_meta/error_reasons.yaml`](https://github.com/dagstack/config-spec/blob/main/_meta/error_reasons.yaml).
+
+### `missing`
+
+Путь не существует в конфиге, и геттер не получил значение по умолчанию.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    config.get_string("nonexistent.path")
+    # ConfigError(
+    #   path="nonexistent.path",
+    #   reason="missing",
+    #   details="Key 'nonexistent.path' not found in config and no default provided",
+    # )
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    config.getString("nonexistent.path");
+    // Бросает ConfigError {
+    //   path: "nonexistent.path",
+    //   reason: "missing",
+    //   details: "Key 'nonexistent.path' not found in config and no default provided",
+    // }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    _, err := cfg.GetString("nonexistent.path")
+    // err: *config.Error {
+    //   Path: "nonexistent.path",
+    //   Reason: config.ReasonMissing,
+    //   Details: "Key 'nonexistent.path' not found in config and no default provided",
+    // }
+    ```
+  </TabItem>
+</Tabs>
+
+**Как обработать**: проверь написание пути, добавь аргумент-default или убедись, что ключ есть в `app-config.yaml`.
+
+### `type_mismatch`
+
+Значение существует, но несовместимо с запрошенным типом.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    # YAML: pool_size: "twenty"
+    config.get_int("database.pool_size")
+    # ConfigError(
+    #   path="database.pool_size",
+    #   reason="type_mismatch",
+    #   details="Expected int, got string 'twenty' (does not match ^-?\\d+$)",
+    # )
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    // YAML: pool_size: "twenty"
+    config.getInt("database.pool_size");
+    // Бросает ConfigError {
+    //   path: "database.pool_size",
+    //   reason: "type_mismatch",
+    //   details: "Expected int, got string 'twenty' (does not match ^-?\\d+$)",
+    // }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    // YAML: pool_size: "twenty"
+    _, err := cfg.GetInt("database.pool_size")
+    // err: *config.Error {
+    //   Path: "database.pool_size",
+    //   Reason: config.ReasonTypeMismatch,
+    //   Details: "expected int, got string (does not match ^-?\\d+$)",
+    // }
+    ```
+  </TabItem>
+</Tabs>
+
+**Как обработать**: смени значение в YAML на подходящее под ожидаемый тип. Интерполированные env-значения всегда строки — убедись, что строковое представление подходит под регулярку типа:
+
+- `int`: `^-?\d+$`
+- `float`: стандартный парсер чисел с плавающей точкой
+- `bool`: `true|false|yes|no|1|0` (без учёта регистра)
+
+### `env_unresolved`
+
+Env-переменная в `${VAR}` не задана, и значение по умолчанию не указано.
+
+```yaml
+# app-config.yaml:
+database:
+  password: "${DB_PASSWORD}"
+```
+
+Если `DB_PASSWORD` не задана:
+
+```
+ConfigError(
+  path="database.password",
+  reason="env_unresolved",
+  details="Environment variable DB_PASSWORD is not set and no default provided",
+)
+```
+
+**Как обработать**: задай env-переменную (`export DB_PASSWORD=...`) или — только для несекретных значений — добавь default в YAML (`${LOG_LEVEL:-INFO}`). Для секретов без default это страховка: пропущенная env-переменная даёт явную ошибку при старте.
+
+### `validation_failed`
+
+Чтение типизированной секции (`get_section` / `getSection` / `GetSection`) не прошло валидацию по схеме.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    class DatabaseConfig(BaseModel):
+        host: str
+        password: str = Field(..., min_length=1)
+
+    # YAML: password: ""  (пустая строка)
+    config.get_section("database", DatabaseConfig)
+    # ConfigError(
+    #   path="database.password",
+    #   reason="validation_failed",
+    #   details="String should have at least 1 character",
+    # )
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    const DatabaseConfigSchema = z.object({
+      host: z.string(),
+      password: z.string().min(1),
+    });
+
+    // YAML: password: ""  (пустая строка)
+    config.getSection("database", DatabaseConfigSchema);
+    // Бросает ConfigError {
+    //   path: "database",
+    //   reason: "validation_failed",
+    //   details: "schema validation failed: String must contain at least 1 character(s)",
+    // }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    type DatabaseConfig struct {
+        Host     string `yaml:"host" validate:"required"`
+        Password string `yaml:"password" validate:"required,min=1"`
+    }
+
+    // YAML: password: ""  (пустая строка)
+    var dbCfg DatabaseConfig
+    err := cfg.GetSection("database", &dbCfg)
+    // err: *config.Error {
+    //   Path: "database.password",
+    //   Reason: config.ReasonValidationFailed,
+    //   Details: "field Password failed 'min' validation",
+    // }
+    ```
+  </TabItem>
+</Tabs>
+
+**Как обработать**: исправь значение в YAML; перед деплоем добавь staging-проверку, которая запускает `Config.load()` плюс `get_section` / `getSection` / `GetSection` для каждой секции.
+
+### `parse_error`
+
+YAML-файл не парсится (синтаксическая ошибка).
+
+```yaml
+# Невалидный YAML:
+database:
+  host: "localhost
+  port: 5432
+```
+
+```
+ConfigError(
+  path="",
+  reason="parse_error",
+  details="YAML parse error at line 3: unexpected end of stream",
+  source_id="yaml:/app/app-config.yaml",
+)
+```
+
+**Как обработать**: прогон через `yamllint` или `yq` и правка синтаксиса. IDE с YAML-линтером сразу показывает ошибки.
+
+### `source_unavailable`
+
+ConfigSource не смог загрузить данные.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    # Файла нет:
+    Config.load("non-existent.yaml")
+    # ConfigError(
+    #   path="",
+    #   reason="source_unavailable",
+    #   details="File '/app/non-existent.yaml' does not exist",
+    #   source_id="yaml:/app/non-existent.yaml",
+    # )
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    // Файла нет:
+    await Config.load("non-existent.yaml");
+    // Бросает ConfigError {
+    //   path: "",
+    //   reason: "source_unavailable",
+    //   details: "cannot read non-existent.yaml: ENOENT: no such file or directory",
+    //   sourceId: "yaml:non-existent.yaml",
+    // }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    // Файла нет:
+    _, err := config.Load(context.Background(), "non-existent.yaml")
+    // err: *config.Error {
+    //   Path: "",
+    //   Reason: config.ReasonSourceUnavailable,
+    //   Details: "open non-existent.yaml: no such file or directory",
+    //   SourceID: "yaml:non-existent.yaml",
+    // }
+    ```
+  </TabItem>
+</Tabs>
+
+Другие планируемые сценарии для источников Phase 2+:
+
+- `EtcdSource`: тайм-аут подключения → `source_unavailable`.
+- `VaultSource`: сбой аутентификации → `source_unavailable`.
+- `HttpSource`: 5xx → `source_unavailable`.
+
+**Как обработать**: убедись, что файл существует / сервис доступен / креды корректны.
+
+### `reload_rejected`
+
+Горячая перезагрузка не была применена, потому что валидация на новой версии конфига провалилась.
+
+```
+ConfigError(
+  path="database.pool_size",
+  reason="reload_rejected",
+  details="New config rejected: database.pool_size expected number, got string 'invalid'",
+)
+```
+
+Эта ошибка **логируется**, а не бросается — перезагрузка откатывается атомарно, подписчики не уведомляются, и приложение продолжает работать со старыми значениями. Диагностическое предупреждение в логе — для оператора.
+
+## Иерархия в каждом биндинге
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.config import ConfigError, ConfigErrorReason
+
+    try:
+        config = Config.load("app-config.yaml")
+        db_cfg = config.get_section("database", DatabaseConfig)
+    except ConfigError as exc:
+        match exc.reason:
+            case ConfigErrorReason.missing:
+                log.error(f"Config does not contain {exc.path}")
+            case ConfigErrorReason.env_unresolved:
+                log.error(f"Env variable for {exc.path} is not set")
+            case ConfigErrorReason.validation_failed:
+                log.error(f"Invalid config at {exc.path}: {exc.details}")
+            case _:
+                log.error(f"Config error: {exc}")
+        raise
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { ConfigError, ConfigErrorReason } from "@dagstack/config";
+
+    try {
+      const config = await Config.load("app-config.yaml");
+      const dbCfg = config.getSection("database", DatabaseConfig);
+    } catch (exc) {
+      if (exc instanceof ConfigError) {
+        switch (exc.reason) {
+          case ConfigErrorReason.missing:
+            log.error(`Config does not contain ${exc.path}`);
+            break;
+          case ConfigErrorReason.env_unresolved:
+            log.error(`Env variable for ${exc.path} is not set`);
+            break;
+          case ConfigErrorReason.validation_failed:
+            log.error(`Invalid config at ${exc.path}: ${exc.details}`);
+            break;
+        }
+      }
+      throw exc;
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    import (
+        "context"
+        "errors"
+        "go.dagstack.dev/config"
+    )
+
+    cfg, err := config.Load(context.Background(), "app-config.yaml")
+    if err != nil {
+        var cfgErr *config.Error
+        if errors.As(err, &cfgErr) {
+            switch cfgErr.Reason {
+            case config.ReasonMissing:
+                log.Errorf("Config does not contain %s", cfgErr.Path)
+            case config.ReasonEnvUnresolved:
+                log.Errorf("Env variable for %s is not set", cfgErr.Path)
+            case config.ReasonValidationFailed:
+                log.Errorf("Invalid config at %s: %s", cfgErr.Path, cfgErr.Details)
+            }
+        }
+        return err
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Маскирование секретов в сообщениях об ошибках
+
+Поля из scrub-списка (`api_key`, `*_token`, `*_password`, `*_secret`, ...) автоматически маскируются внутри `details`:
+
+```
+ConfigError(
+  path="database.password",
+  reason="validation_failed",
+  details="Password '[MASKED]' does not match required pattern",  # реальное значение скрыто
+)
+```
+
+См. [Секреты](../concepts/secrets).
+
+## См. также
+
+- [ADR-0001 §5 Модель ошибок](../spec/adr/0001-yaml-configuration) — нормативный контракт.
+- [Источники (ConfigSource)](../concepts/sources) — `source_unavailable` зависит от типа источника.
+- [Горячая перезагрузка](../concepts/watch) — `reload_rejected` и атомарный откат.

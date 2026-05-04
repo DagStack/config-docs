@@ -1,0 +1,316 @@
+---
+sidebar_position: 5
+title: Горячая перезагрузка (watch)
+description: Подписка на свою секцию через onSectionChange, атомарный откат при невалидной конфигурации и неактивная подписка subscription_without_watch.
+slug: /concepts/watch
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Горячая перезагрузка (watch)
+
+:::caution API Phase 2 — не активен в v0.1 / v0.2
+Реактивные обновления описаны как целевая семантика, но в текущих
+биндингах (`dagstack-config` v0.2.0, `config-go` v0.1.0,
+`@dagstack/config` v0.1.0) **не реализованы**:
+методы регистрации (`on_change` / `on_section_change` / `reload` в
+Python, `OnChange` / `OnSectionChange` / `Reload` в Go) есть в
+API и возвращают `Subscription` / `*Subscription`, но callback
+**никогда не вызывается** (`active = False` / `IsActive() == false`).
+`reload()` / `Reload(ctx)` — no-op. В TypeScript эти методы пока вообще
+не выставлены.
+
+В Phase 2 появится: наблюдение через fsnotify для
+`YamlFileSource`, атомарный откат при невалидной перезагрузке и
+активные подписки. До этого момента страница служит **целевой
+спецификацией** (ADR-0001 §7.2) для пилотной реализации — синтаксис
+будет ровно таким, как описано ниже.
+:::
+
+dagstack/config поддерживает реактивные обновления: компоненты приложения могут подписаться на изменения собственной секции и применить их без перезапуска процесса. Поддержка зависит от возможностей `ConfigSource`: `YamlFileSource` следит за файлами через fsnotify; `EtcdSource` использует gRPC-стрим; `HttpSource` — SSE / long polling.
+
+## Базовая подписка
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from pydantic import BaseModel
+
+
+    class DatabaseConfig(BaseModel):
+        host: str
+        port: int = 5432
+        name: str
+        pool_size: int = 20
+
+
+    config = Config.load("app-config.yaml")
+
+    def on_new_db_config(new: DatabaseConfig) -> None:
+        print(f"Database reconfigured: pool_size={new.pool_size}")
+        apply_pool(new)
+
+    sub = config.on_section_change("database", DatabaseConfig, on_new_db_config)
+
+    # ... в какой-то момент остановить подписку ...
+    sub.unsubscribe()
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { z } from "zod";
+    import { Config } from "@dagstack/config";
+
+    const DatabaseConfig = z.object({
+      host: z.string(),
+      port: z.number().int().default(5432),
+      name: z.string(),
+      pool_size: z.number().int().default(20),
+    });
+    type DatabaseConfig = z.infer<typeof DatabaseConfig>;
+
+    const config = await Config.load("app-config.yaml");
+
+    const sub = config.onSectionChange("database", DatabaseConfig, (newConfig: DatabaseConfig) => {
+      console.log(`Database reconfigured: pool_size=${newConfig.pool_size}`);
+      applyPool(newConfig);
+    });
+
+    // ...
+    sub.unsubscribe();
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    type DatabaseConfig struct {
+        Host     string `yaml:"host"`
+        Port     int    `yaml:"port"`
+        Name     string `yaml:"name"`
+        PoolSize int    `yaml:"pool_size"`
+    }
+
+    cfg, _ := config.Load(context.Background(), "app-config.yaml")
+
+    sub, _ := cfg.OnSectionChange("database", &DatabaseConfig{}, func(new any) {
+        c := new.(*DatabaseConfig)
+        log.Printf("Database reconfigured: pool_size=%d", c.PoolSize)
+        applyPool(c)
+    })
+    defer sub.Unsubscribe()
+    ```
+  </TabItem>
+</Tabs>
+
+## Объект Subscription
+
+`onSectionChange` возвращает объект `Subscription` со следующими полями:
+
+```
+unsubscribe():   void               # остановить подписку, идемпотентно
+active:          boolean             # получает ли callback события
+inactive_reason: string | null       # если active=false, причина
+path:            string              # отслеживаемая секция
+```
+
+После `unsubscribe()` callback **не вызывается** даже для уже идущих циклов перезагрузки (см. раздел про атомарность ниже).
+
+## Атомарный откат при невалидной конфигурации
+
+Когда любой источник сигнализирует об изменении:
+
+1. Загрузчик собирает новый ConfigTree (с учётом всех слоёв).
+2. Применяется интерполяция env.
+3. Для **каждой** подписанной секции новое значение валидируется по схеме.
+4. Если **хотя бы одна** валидация упала, **вся** перезагрузка откатывается. Никто из подписчиков не уведомляется. В диагностический лог пишется предупреждение.
+5. Если все валидации прошли, подписчики получают обратные вызовы параллельно (fire-and-forget).
+
+Эта **атомарность на уровне всего дерева** не даёт частично применить невалидную конфигурацию. Пример:
+
+```yaml title="app-config.yaml (валидный)"
+database:
+  pool_size: 20
+cache:
+  ttl_min: 15
+```
+
+```yaml title="app-config.yaml (после правки — cache.ttl_min сломан)"
+database:
+  pool_size: 50              # валидно
+cache:
+  ttl_min: "fifteen"         # невалидно — ожидается int
+```
+
+Поведение:
+
+- Подписчик `database` **не** получит новый `pool_size=50`.
+- Подписчик `cache` тоже **не** получит нового значения.
+- В диагностический лог записывается: `reload rejected — cache.ttl_min: validation_failed (expected int, got string)`.
+- Приложение продолжает работать со **старыми** значениями обеих секций.
+
+Контракт защищает от ситуации, когда один компонент применил новый конфиг, а другой — нет, и система оказалась в несогласованном состоянии.
+
+## `active=false` — когда источник не умеет следить
+
+Если ни один из активных источников не поддерживает наблюдение за изменениями, подписка регистрируется, но никогда не получает событий:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    sub = config.on_section_change("database", DatabaseConfig, callback)
+    print(sub.active)            # False
+    print(sub.inactive_reason)   # "subscription_without_watch"
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    const sub = config.onSectionChange("database", DatabaseConfig, callback);
+    console.log(sub.active);          // false
+    console.log(sub.inactive_reason); // "subscription_without_watch"
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    sub, _ := cfg.OnSectionChange("database", &DatabaseConfig{}, callback)
+    fmt.Println(sub.Active())           // false
+    fmt.Println(sub.InactiveReason())   // "subscription_without_watch"
+    ```
+  </TabItem>
+</Tabs>
+
+Код компонента работает одинаково в обоих сценариях — при `active=false` callback просто не срабатывает. На момент подписки в лог однократно пишется диагностическое предупреждение `subscription_without_watch`, чтобы оператор знал: горячая перезагрузка отключена.
+
+## Стратегии применения изменений
+
+**Стратегия 1 — целиком заменить клиент / пул:**
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    def on_new_db_config(new: DatabaseConfig) -> None:
+        old_pool = self._pool
+        self._pool = create_pool(new)  # атомарная подмена
+        asyncio.create_task(gracefully_close(old_pool))  # закрыть старый пул в фоне
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    function onNewDbConfig(next: DatabaseConfig): void {
+      const oldPool = this.pool;
+      this.pool = createPool(next);          // атомарная подмена
+      void gracefullyClose(oldPool);         // закрыть старый пул в фоне
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    func (s *Service) onNewDbConfig(new any) {
+        c := new.(*DatabaseConfig)
+        old := s.pool.Load()
+        s.pool.Store(createPool(c))          // атомарная подмена через atomic.Pointer
+        go gracefullyClose(old)              // закрыть старый пул в фоне
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+**Стратегия 2 — обновление на месте:**
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    def on_new_db_config(new: DatabaseConfig) -> None:
+        self._pool.resize(new.pool_size)
+        # host/port на лету не меняются — нужна пересборка.
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    function onNewDbConfig(next: DatabaseConfig): void {
+      this.pool.resize(next.pool_size);
+      // host/port на лету не меняются — нужна пересборка.
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    func (s *Service) onNewDbConfig(new any) {
+        c := new.(*DatabaseConfig)
+        s.pool.Resize(c.PoolSize)
+        // host/port на лету не меняются — нужна пересборка.
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+**Стратегия 3 — отложенное применение:**
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    self._pending_db = None
+
+    def on_new_db_config(new: DatabaseConfig) -> None:
+        self._pending_db = new
+
+    # На входе каждого запроса:
+    if self._pending_db:
+        self.apply_db_config(self._pending_db)
+        self._pending_db = None
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    let pendingDb: DatabaseConfig | null = null;
+
+    function onNewDbConfig(next: DatabaseConfig): void {
+      pendingDb = next;
+    }
+
+    // На входе каждого запроса:
+    if (pendingDb !== null) {
+      applyDbConfig(pendingDb);
+      pendingDb = null;
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    var pendingDB atomic.Pointer[DatabaseConfig]
+
+    func onNewDbConfig(new any) {
+        c := new.(*DatabaseConfig)
+        pendingDB.Store(c)
+    }
+
+    // На входе каждого запроса:
+    if c := pendingDB.Swap(nil); c != nil {
+        applyDBConfig(c)
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Выбор зависит от типа клиента и характера изменений. `on_section_change` / `onSectionChange` / `OnSectionChange` вызывается из внутреннего контекста загрузчика (точное планирование зависит от реализации: Python и TypeScript используют async-таску, Go — горутину), поэтому callback **должен быть быстрым и потокобезопасным**.
+
+## Ограничения
+
+- Наблюдение работает на уровне **источника целиком**, а не конкретной секции. Загрузчик подписывается на источник, слышит «что-то изменилось» и пересобирает всё дерево.
+- Обратные вызовы — fire-and-forget; ошибка внутри обратного вызова логируется и не прокидывается дальше; остальные подписчики уведомляются штатно.
+- Гарантий по порядку между подписчиками разных секций нет.
+
+## Когда watch не работает
+
+`ConfigSource` может не поддерживать наблюдение по техническим причинам:
+
+- `InMemorySource` (Python/TS) / `DictSource` (Go) — лежит в памяти, заполняется из кода, в рантайме не меняется.
+- `JsonFileSource` — наблюдение не реализовано в v0.1 (fsnotify в плане Phase 2).
+- Кастомный источник без метода `watch()`.
+
+В этих случаях подписка всё равно регистрируется, но `active=false`. Приложение должно корректно работать без горячей перезагрузки (например, требуя перезапуска при смене конфигурации в production).
+
+## См. также
+
+- [Источники (ConfigSource)](./sources) — какие источники поддерживают наблюдение.
+- [ADR-0001 §7 Реактивные подписки](../spec/adr/0001-yaml-configuration) — нормативный контракт подписок.
+- [Руководство: Тестирование](../guides/testing) — как мокать и проверять подписки.
