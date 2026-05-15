@@ -1,0 +1,385 @@
+---
+sidebar_position: 1
+title: Declare a section
+description: How an application component declares its config section — schema, getSection, validation, isolation from other sections.
+slug: /guides/declaring-section
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Declaring a configuration section
+
+Every component / plugin / service in an application must declare **its own section** of the configuration — a top-level key in YAML and a schema that matches that key.
+
+## Step 1. Pick a section name
+
+Naming conventions:
+
+| Recommendation | Example |
+|---|---|
+| `snake_case` | `database`, `payment_provider`, `rate_limit` |
+| Singular noun | `database`, not `databases` |
+| No `_config` / `_settings` suffix | `database`, not `database_config` |
+| Short but unique | 2–3 words joined by `_` |
+
+For plugins, the section name is normative: **`<kind>.<name>`** ([ADR-0001 §4](../spec/adr/0001-yaml-configuration)).
+
+## Step 2. Write the schema
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="app/database.py"
+    from pydantic import BaseModel, Field, field_validator
+
+
+    class DatabaseConfig(BaseModel):
+        host: str
+        port: int = Field(5432, ge=1, le=65535)
+        name: str
+        user: str
+        password: str = Field(..., min_length=1)
+        pool_size: int = Field(20, ge=1, le=1000)
+        ssl: bool = False
+
+        @field_validator("host")
+        @classmethod
+        def must_not_be_wildcard(cls, v: str) -> str:
+            if v in ("0.0.0.0", "*"):
+                raise ValueError("host must be a concrete address")
+            return v
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts title="app/database.ts"
+    import { z } from "zod";
+
+    export const DatabaseConfig = z.object({
+      host: z.string().refine(
+        (v) => v !== "0.0.0.0" && v !== "*",
+        "host must be a concrete address",
+      ),
+      port: z.number().int().min(1).max(65535).default(5432),
+      name: z.string(),
+      user: z.string(),
+      password: z.string().min(1),
+      pool_size: z.number().int().min(1).max(1000).default(20),
+      ssl: z.boolean().default(false),
+    });
+
+    export type DatabaseConfig = z.infer<typeof DatabaseConfig>;
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="app/database.go"
+    type DatabaseConfig struct {
+        Host     string `yaml:"host" validate:"required,ne=0.0.0.0"`
+        Port     int    `yaml:"port" validate:"min=1,max=65535"`
+        Name     string `yaml:"name" validate:"required"`
+        User     string `yaml:"user" validate:"required"`
+        Password string `yaml:"password" validate:"required,min=1"`
+        PoolSize int    `yaml:"pool_size" validate:"min=1,max=1000"`
+        SSL      bool   `yaml:"ssl"`
+    }
+
+    func defaultDatabaseConfig() DatabaseConfig {
+        return DatabaseConfig{
+            Port:     5432,
+            PoolSize: 20,
+            SSL:      false,
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Schema requirements:
+
+- **Every required field** is marked explicitly (`Field(...)` without a default in pydantic; `z.string()` without `.default()` in zod; `validate:"required"` in a Go struct tag).
+- **Default values** are spelled out for every optional field.
+- **Range validation** (min / max / pattern) is declarative, so you do not have to enforce it at runtime.
+- **Typed fields** — avoid `Any` / `unknown`; every field has an explicit type.
+
+## Step 3. Read the section
+
+The method name differs across bindings (`get_section` / `getSection` / `GetSection`):
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.config import Config
+
+    config = Config.load("app-config.yaml")
+    db_cfg = config.get_section("database", DatabaseConfig)
+    # db_cfg is a DatabaseConfig instance, already validated.
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { Config } from "@dagstack/config";
+
+    const config = await Config.load("app-config.yaml");
+    const dbCfg = config.getSection("database", DatabaseConfigSchema);
+    // dbCfg is a z.infer<typeof DatabaseConfigSchema> value, already validated.
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    cfg, _ := config.Load(context.Background(), "app-config.yaml")
+    dbCfg := defaultDatabaseConfig()
+    if err := cfg.GetSection("database", &dbCfg); err != nil {
+        return err
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+The method:
+
+1. Extracts the subtree at the given path.
+2. Runs schema validation.
+3. Returns a typed object.
+
+On failure → `ConfigError(validation_failed)` carrying the field, the expected type, and the actual value (with secret fields masked).
+
+## Step 4. Isolation — read only your own section
+
+**The rule:** a component reads **only its own** section. Reading another component's section is an anti-pattern.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    # Right — inside the database service:
+    db_cfg = config.get_section("database", DatabaseConfig)
+
+    # Wrong — the database service reads someone else's section:
+    cache_cfg = config.get_section("cache", CacheConfig)
+    # The database service now depends on the structure of cache.
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    // Right — inside the database service:
+    const dbCfg = config.getSection("database", DatabaseConfigSchema);
+
+    // Wrong — the database service reads someone else's section:
+    const cacheCfg = config.getSection("cache", CacheConfigSchema);
+    // The database service now depends on the structure of cache.
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    // Right — inside the database service:
+    var dbCfg DatabaseConfig
+    _ = cfg.GetSection("database", &dbCfg)
+
+    // Wrong — the database service reads someone else's section:
+    var cacheCfg CacheConfig
+    _ = cfg.GetSection("cache", &cacheCfg)
+    // The database service now depends on the structure of cache.
+    ```
+  </TabItem>
+</Tabs>
+
+Why:
+
+- **Coupling.** If service A reads service B's config, a schema change in service B breaks service A. A hidden coupling without explicit boundaries.
+- **Testability.** Mocking only the `database` section is easier than mocking an entire config with every other component's section.
+- **Security.** In production, services may have different read permissions for different sections (through a governance middleware); hard-coded reads of someone else's section bypass that policy.
+
+**The right alternative:** if two services need to share a setting (for example, a common `max_payload_mb`), put it in a separate `shared` section and read it from both:
+
+```yaml
+shared:
+  max_payload_mb: 10
+
+database:
+  host: "localhost"
+  pool_size: 20
+
+api:
+  host: "0.0.0.0"
+  port: 8080
+```
+
+## Step 5. Defaults for optional fields
+
+All optional fields declare their defaults **in the schema**, not in code:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    class DatabaseConfig(BaseModel):
+        host: str                                # required
+        user: str                                # required
+        password: str                            # required
+        port: int = 5432                         # default in the schema
+        pool_size: int = 20                      # default in the schema
+        ssl: bool = False                        # default in the schema
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    const DatabaseConfigSchema = z.object({
+      host: z.string(),                          // required
+      user: z.string(),                          // required
+      password: z.string(),                      // required
+      port: z.number().int().default(5432),     // default in the schema
+      pool_size: z.number().int().default(20),  // default in the schema
+      ssl: z.boolean().default(false),           // default in the schema
+    });
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    // Go declares defaults by populating a zero-value struct BEFORE GetSection.
+    // GetSection only fills in fields that are present in the YAML — the rest
+    // keep their initial values.
+    dbCfg := DatabaseConfig{
+        Port:     5432,
+        PoolSize: 20,
+        SSL:      false,
+    }
+    _ = cfg.GetSection("database", &dbCfg)
+    // host/user/password are required (validated externally or through
+    // go-playground/validator struct tags).
+    ```
+  </TabItem>
+</Tabs>
+
+The anti-pattern is to enforce defaults in code after the read:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    # WRONG — defaults applied in code:
+    cfg = config.get_section("database", DatabaseConfig)
+    port = cfg.port or 5432                      # ← this kind of default makes the schema dishonest
+    pool = cfg.pool_size or 20
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    // WRONG — defaults applied in code:
+    const cfg = config.getSection("database", DatabaseConfigSchema);
+    const port = cfg.port ?? 5432;               // ← this kind of default makes the schema dishonest
+    const pool = cfg.pool_size ?? 20;
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    // WRONG — defaults applied in code after the call:
+    var cfg DatabaseConfig
+    _ = config.GetSection("database", &cfg)
+    if cfg.Port == 0 { cfg.Port = 5432 }         // ← schema is dishonest
+    if cfg.PoolSize == 0 { cfg.PoolSize = 20 }
+    ```
+  </TabItem>
+</Tabs>
+
+If a default is set in the schema, `get_section` / `getSection` / `GetSection` always returns a fully populated object. The code does not have to guess.
+
+## Step 6. Document the section
+
+Every section should be documented:
+
+- **A description for every field** — comment / docstring in the schema.
+- **A config example** — an `app-config.yaml` snippet in the component README.
+- **Notes on ranges** — why `pool_size` is bounded between 1 and 1000 instead of being unbounded above.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    class DatabaseConfig(BaseModel):
+        """Configuration for application database connection.
+
+        Note: password is masked in diagnostic output automatically.
+        """
+
+        host: str = Field(
+            ...,
+            description="Database server host.",
+            examples=["localhost", "db.internal.example.com"],
+        )
+        port: int = Field(
+            5432,
+            description="TCP port of the database server.",
+            ge=1,
+            le=65535,
+        )
+        pool_size: int = Field(
+            20,
+            description="Connection pool size. Range: 1-1000. Typical dev: 5-10, prod: 50-200.",
+            ge=1,
+            le=1000,
+        )
+    ```
+
+    `pydantic.Field`'s `description` / `examples` flow into the JSON schema,
+    which is then surfaced in IDE tooltips and auto-generated documentation.
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    /**
+     * Configuration for application database connection.
+     * Note: password is masked in diagnostic output automatically.
+     */
+    const DatabaseConfigSchema = z.object({
+      host: z
+        .string()
+        .describe("Database server host, e.g. 'localhost' or 'db.internal.example.com'."),
+      port: z
+        .number()
+        .int()
+        .min(1)
+        .max(65535)
+        .default(5432)
+        .describe("TCP port of the database server."),
+      pool_size: z
+        .number()
+        .int()
+        .min(1)
+        .max(1000)
+        .default(20)
+        .describe("Connection pool size. Typical dev: 5-10, prod: 50-200."),
+    });
+
+    type DatabaseConfig = z.infer<typeof DatabaseConfigSchema>;
+    ```
+
+    The metadata on `zod`'s `.describe()` is available through
+    `DatabaseConfigSchema._def.description` and feeds into the
+    `zod-to-json-schema` conversion that powers auto-generated docs.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    // DatabaseConfig — configuration for application database connection.
+    //
+    // Note: password is masked in diagnostic output automatically.
+    type DatabaseConfig struct {
+        // Host is the database server host, e.g. "localhost" or
+        // "db.internal.example.com".
+        Host string `yaml:"host" validate:"required"`
+
+        // Port is the TCP port of the database server. Range: 1-65535.
+        Port int `yaml:"port" validate:"gte=1,lte=65535" default:"5432"`
+
+        // PoolSize is the connection pool size. Typical dev: 5-10,
+        // prod: 50-200. Range: 1-1000.
+        PoolSize int `yaml:"pool_size" validate:"gte=1,lte=1000" default:"20"`
+    }
+    ```
+
+    Go doc comments show up in `go doc` / `pkg.go.dev` / IDE tooltips
+    automatically. Struct tags (`validate:` / `default:`) are read by
+    `go-playground/validator` + `creasty/defaults` during
+    `GetSection(path, &dbCfg)`.
+  </TabItem>
+</Tabs>
+
+## See also
+
+- [Environment variable substitution](../concepts/substitution) — how secret fields arrive from env.
+- [Secrets](../concepts/secrets) — automatic masking of password / *_token / *_key.
+- [Guide: Testing](./testing) — how to test a section with a mock configuration.
+- [ADR-0001 §4 Config access API](../spec/adr/0001-yaml-configuration) — the normative `getSection` contract.

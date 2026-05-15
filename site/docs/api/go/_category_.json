@@ -1,0 +1,11 @@
+{
+  "label": "Go",
+  "position": 3,
+  "collapsible": true,
+  "collapsed": true,
+  "link": {
+    "type": "generated-index",
+    "title": "Go API",
+    "description": "Auto-generated reference for the public API of the go.dagstack.dev/config package."
+  }
+}

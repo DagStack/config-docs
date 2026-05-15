@@ -1,0 +1,11 @@
+{
+  "label": "Concepts",
+  "position": 2,
+  "collapsible": true,
+  "collapsed": false,
+  "link": {
+    "type": "generated-index",
+    "title": "Concepts",
+    "description": "Core concepts of the config stack — sources, layers, environment variable substitution, secret masking, hot reload."
+  }
+}

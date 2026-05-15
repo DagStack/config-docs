@@ -1,0 +1,253 @@
+---
+sidebar_position: 1
+title: ADR-0001 · YAML-конфигурация
+description: Нормативный контракт — YAML как формат передачи, интерполяция env, послойное слияние, типизированный доступ, семантика подписок, канонический JSON.
+slug: /spec/adr/0001-yaml-configuration
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# ADR-0001 · YAML-конфигурация с интерполяцией env
+
+**Статус**: accepted v2.0 (2026-04-19; v1.0 — 2026-04-17) · [Полный нормативный текст](https://github.com/dagstack/config-spec/blob/main/adr/0001-yaml-configuration.md)
+
+## Зачем единая спецификация конфигурации
+
+Приложения на dagstack пишутся на разных языках (Python, TypeScript, Go) и используют разные библиотеки конфигурации по умолчанию (`python-dotenv`, `dotenv`, `viper`). В итоге оператор видит в каждом приложении свою модель конфигурации, знание не переносится между ними, а split dev / staging / production реализован ad hoc.
+
+Соседние экосистемы решали ту же задачу одинаково: **YAML + интерполяция env + слои развёртывания + типизированный доступ через нативные модели языка**:
+
+- **`@backstage/config`** (Spotify) — YAML + env + глубокое слияние + горячая перезагрузка.
+- **Spring Boot** — `application.yml` + профили + `@ConfigurationProperties`.
+- **HashiCorp Viper** — multi-format + переопределения через env + struct unmarshal.
+
+ADR-0001 кодифицирует эту модель как **language-agnostic контракт** для экосистемы dagstack — формат передачи и поверхность API одинаковы в Python / TypeScript / Go.
+
+## Семь ключевых решений
+
+### 1. YAML как основной формат передачи
+
+YAML 1.2 (совместим с парсерами YAML 1.1) — один и тот же файл одинаково читают все реализации. JSON допустим как эквивалент (YAML 1.2 — надмножество JSON), для окружений без YAML-парсера.
+
+### 2. Синтаксис интерполяции env
+
+```
+${VAR}              → значение VAR; если не задана, ConfigError(env_unresolved)
+${VAR:-default}     → значение VAR; если не задана или пустая, литерал "default"
+```
+
+Семантика:
+
+- Интерполяция запускается **на этапе загрузки файла**, до слияния и до приведения типов.
+- Интерполированное значение — всегда **строка**. Типизация происходит внутри типизированного геттера.
+- `$$` экранируется в `$`.
+- Default — литеральная строка; вложенные `${...}` внутри значения по умолчанию **не** интерполируются.
+
+### 3. Слои конфигурации и правила слияния
+
+Три слоя в порядке приоритета:
+
+1. `app-config.yaml` — база (коммитится).
+2. `app-config.local.yaml` — переопределения разработчика (gitignored).
+3. `app-config.${DAGSTACK_ENV}.yaml` — для конкретного окружения (коммитится).
+
+**`DAGSTACK_ENV`**, не `APP_ENV` / `NODE_ENV` — env-переменная с пространством имён, чтобы избежать коллизий в развёртываниях со смесью фреймворков.
+
+Стратегия слияния:
+
+- **Объекты (map'ы)** — рекурсивное глубокое слияние.
+- **Массивы** — атомарная замена, без конкатенации.
+
+Составные профили (в стиле `prod,us-east` Spring Boot) **отложены** в Phase 2.
+
+### 4. API доступа к конфигурации
+
+**Псевдокод** контракта (каждая реализация делает идиоматично):
+
+```
+Config.load(path):                   Config           # обёртка над loadFrom([YamlFileSource(path)])
+Config.load(paths[]):                Config
+Config.loadFrom(sources[]):          Config
+
+config.has(path):                    boolean
+config.get(path):                    Value
+config.getString(path, default?):    string
+config.getInt(path, default?):       int
+config.getNumber(path, default?):    float
+config.getBool(path, default?):      boolean
+config.getList(path):                Value[]
+
+config.getSection(path, schema):     TypedObject
+```
+
+- `path` — точечная нотация (`database.host`, `plugins[0]`, `labels.kubernetes\.io/zone`).
+- `getSection` использует нативную схему: pydantic / zod / struct-теги.
+- **Правило изоляции**: компонент читает только свою секцию.
+
+**Конвенция именования — идиоматична для каждого языка**. ADR фиксирует
+семантику; каждый биндинг выбирает регистр под нативный стиль:
+
+- **Python** — `snake_case`: `config.get_string`, `config.get_int`,
+  `config.get_section`, `config.on_section_change`, `Config.load_from`.
+- **TypeScript** — `camelCase`: `config.getString`, `config.getInt`,
+  `config.getSection`, `config.onSectionChange`, `Config.loadFrom`.
+- **Go** — `PascalCase` (публичный API): `cfg.GetString`, `cfg.GetInt`,
+  `cfg.GetSection`, `cfg.OnSectionChange`, `config.LoadFrom`. Для
+  семантики «значение по умолчанию» Go добавляет суффикс `Default`
+  (`cfg.GetIntDefault(path, 10)`) вместо параметра `default`, чтобы
+  сигнатуры оставались однозначными.
+
+**Sync vs async** оставлен на усмотрение реализации. Python — sync (Phase 1);
+TypeScript — async (`Promise<Config>` из `Config.load`); Go — sync
+с `context.Context` первым аргументом и возвратом `error`.
+Реализация фиксирует свой выбор в per-language ADR и в `conformance-runner`.
+
+### 5. Модель ошибок
+
+```
+ConfigError {
+  path:        string                 # точечный путь к ошибке
+  reason:      ConfigErrorReason      # enum, зафиксирован в _meta/error_reasons.yaml
+  details:     string                 # человекочитаемое сообщение
+  source_id?:  string                 # какой ConfigSource, если применимо
+}
+
+ConfigErrorReason ∈ {
+  missing, type_mismatch, env_unresolved, validation_failed,
+  parse_error, source_unavailable, reload_rejected
+}
+```
+
+Идиоматические реализации: Python `raise`, TypeScript `throw`, Go `return (value, error)`, Rust `Result<T, ConfigError>`, Java `throw`. Имя типа — конвенция, но **поля обязательны**.
+
+### 6. Абстракция ConfigSource
+
+Каждый источник реализует минимальный интерфейс:
+
+```
+id:                     string
+load():                 ConfigTree
+watch?(callback):       Subscription        # опционально
+close?():               void                 # опционально
+```
+
+Встроенные источники Phase 1: `YamlFileSource`, `JsonFileSource`, in-memory-источник (`InMemorySource` в Python/TypeScript, `DictSource` в Go — историческое расхождение в именовании; семантика идентична).
+
+В плане Phase 2+: адаптеры `EtcdSource`, `ConsulSource`, `VaultSource`, `HttpSource`, `SqlSource`, `KubernetesSource`.
+
+### 7. Подписки / реактивная перезагрузка
+
+```
+config.onSectionChange(path, schema, callback) → Subscription {
+  unsubscribe():   void        # идемпотентно
+  active:          boolean
+  inactive_reason: string | null
+  path:            string
+}
+```
+
+**Поведение**:
+
+- Если ни один источник не поддерживает наблюдение → подписка принимается, но `active=false` с `inactive_reason = "subscription_without_watch"`.
+- **Атомарный откат** на уровне всего дерева: если хоть одна подписанная секция не прошла валидацию, вся перезагрузка откатывается, и никто из подписчиков не уведомляется.
+- Unsubscribe идемпотентен; callback не вызывается после unsubscribe даже для уже идущих циклов перезагрузки.
+- Callback'и — fire-and-forget (sync или async — зависит от реализации).
+
+Это ключевая страховка от скрытых багов: приложение ведёт себя одинаково на источниках с наблюдением и без (отличается только `active`).
+
+## Пример конфигурации с тремя слоями
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```yaml title="app-config.yaml"
+    database:
+      host: "${DB_HOST:-localhost}"
+      port: "${DB_PORT:-5432}"
+      name: "orders"
+      user: "${DB_USER}"
+      password: "${DB_PASSWORD}"
+      pool_size: 20
+
+    cache:
+      url: "${REDIS_URL:-redis://localhost:6379/0}"
+      ttl_min: 15
+
+    api:
+      port: 8080
+      request_timeout_s: 30
+    ```
+
+    ```yaml title="app-config.local.yaml (gitignored)"
+    database:
+      pool_size: 5            # меньше соединений локально
+    api:
+      request_timeout_s: 120  # медленный отладчик
+    ```
+
+    ```yaml title="app-config.production.yaml"
+    database:
+      host: "prod-db.internal.example.com"
+      pool_size: 100
+    cache:
+      url: "redis://prod-cache.internal.example.com:6379/0"
+    ```
+
+    ```python title="main.py"
+    from dagstack.config import Config
+
+    config = Config.load("app-config.yaml")
+    # DAGSTACK_ENV=production → итоговый конфиг:
+    #   database.host = "prod-db.internal.example.com"   (из production)
+    #   database.pool_size = 5                            (из local; production не переопределил)
+    #   database.port = 5432                              (из базы)
+    #   cache.url = "redis://prod-cache.internal.example.com:6379/0"
+    #   api.request_timeout_s = 120                       (из local)
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts title="main.ts"
+    import { Config } from "@dagstack/config";
+
+    const config = await Config.load("app-config.yaml");
+    // DAGSTACK_ENV=production — та же семантика, async-версия.
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="main.go"
+    cfg, err := config.Load(context.Background(), "app-config.yaml")
+    // DAGSTACK_ENV=production — та же семантика, sync с error.
+    ```
+  </TabItem>
+</Tabs>
+
+## Последствия
+
+**Положительные:**
+
+- Оператор видит единую модель конфигурации независимо от языка приложения.
+- Секреты по умолчанию проходят через интерполяцию env — они не попадают в git.
+- Горячая перезагрузка поддерживается без ломающих изменений API при смене источника (YamlFileSource → EtcdSource — код плагина не страдает).
+- Атомарный откат не даёт частично применить невалидную конфигурацию.
+
+**Компромиссы:**
+
+- **Запрет на вложенные значения по умолчанию** (`${VAR:-${OTHER}}` не работает) сохраняет парсер простым, но иногда требует двухэтапного подхода в shell-скриптах.
+- **Полная замена массивов** — каждое переопределение должно содержать массив целиком; синтаксиса «добавить элемент» нет.
+- **Sync vs async выбираются реализацией** — добавляет расхождение в документации между биндингами («в Python — async, в Go — sync»); смягчается per-language ADR-аддендумом.
+
+**Запрещено этим ADR:**
+
+- Реализация не может вводить собственную модель слияния (deep merge для массивов, shallow для вложенных объектов) — глубокое слияние объектов и замена массивов нормативно обязательны.
+- `ConfigError` без `path` / `reason` / `details` — эти поля обязательны.
+- Молчаливая подмена на пустую строку при отсутствующей env-переменной без default — это **ошибка**; плагин не должен стартовать.
+
+## Связанные ADR и спецификации
+
+- [`plugin-system-spec` ADR-0006 § discovery](https://github.com/dagstack/plugin-system-spec/blob/main/adr/0006-file-based-plugin-discovery.md) — discovery использует конфиг для `plugin_dirs`.
+- `logger-spec` — читает секцию `logging` через конфиг.
+- `tenancy-spec` — читает секцию `tenancy`.
+
+## Нормативный источник
+
+Полный текст с формальными правилами canonical-JSON (подмножество RFC 8785), артефактами спецификации и дорожной картой адаптеров: [`config-spec/adr/0001-yaml-configuration.md`](https://github.com/dagstack/config-spec/blob/main/adr/0001-yaml-configuration.md).

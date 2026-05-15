@@ -1,0 +1,279 @@
+---
+sidebar_position: 1
+title: Quick start
+description: Install dagstack/config and read your first hierarchical YAML config — sections, env variables, typed access in Python, TypeScript, Go.
+slug: /intro
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Quick start
+
+`dagstack/config` is a universal hierarchical configuration stack for applications across any domain (web services, data pipelines, workflow orchestrators, AI platforms). It provides:
+
+- **YAML as a single transport format** — the same file is read identically in Python, TypeScript, and Go.
+- **Configuration layers** — `app-config.yaml` (base) → `app-config.local.yaml` (developer overrides) → `app-config.${DAGSTACK_ENV}.yaml` (environment overrides).
+- **Environment variable substitution** — `${VAR}` / `${VAR:-default}` is interpolated at load time.
+- **Typed access** — `get_section` / `getSection` / `GetSection` (depending on the language) backed by pydantic / zod / struct tags.
+- **Secret masking** — fields with names like `api_key`, `*_token`, `*_password` are automatically excluded from diagnostic logs.
+- **Hot reload** — subscribe via `on_section_change` / `onSectionChange` / `OnSectionChange` (depending on the language) without restarting the process.
+
+:::info Release status
+The Python and TypeScript packages are being prepared for publication on PyPI and npmjs.org. They are currently available from an internal repository. The Go binding is on the roadmap; the examples below show the planned signature.
+:::
+
+## Installation
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```bash
+    pip install dagstack-config
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```bash
+    npm install @dagstack/config
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```bash
+    go get go.dagstack.dev/config
+    ```
+  </TabItem>
+</Tabs>
+
+## Your first configuration
+
+Create a base `app-config.yaml` file at the root of your application. Env substitutions look up environment variables at load time; without `:-default`, a missing variable raises an error.
+
+```yaml title="app-config.yaml"
+app:
+  name: "order-service"
+  tagline: "Order processor"
+
+database:
+  host: "${DB_HOST:-localhost}"
+  port: "${DB_PORT:-5432}"
+  name: "${DB_NAME:-orders}"
+  user: "${DB_USER}"
+  password: "${DB_PASSWORD}"
+  pool_size: 20
+
+cache:
+  url: "${REDIS_URL:-redis://localhost:6379/0}"
+  ttl_min: 15
+
+api:
+  host: "0.0.0.0"
+  port: 8080
+  request_timeout_s: 30
+```
+
+Local overrides go into `app-config.local.yaml` (which is listed in `.gitignore`):
+
+```yaml title="app-config.local.yaml"
+database:
+  pool_size: 5         # fewer connections locally
+
+api:
+  request_timeout_s: 120   # slow debugger
+```
+
+Environment-specific overrides go into `app-config.production.yaml` (committed):
+
+```yaml title="app-config.production.yaml"
+database:
+  host: "prod-db.internal.example.com"
+  pool_size: 100
+
+cache:
+  url: "redis://prod-cache.internal.example.com:6379/0"
+```
+
+When `DAGSTACK_ENV=production`, the loader reads all three files in the order `base → local → production`, performs a deep merge, and returns the resulting `Config`.
+
+## Loading and reading
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.config import Config
+
+    config = Config.load("app-config.yaml")
+
+    # Basic accessors:
+    print(config.get_string("app.name"))              # "order-service"
+    print(config.get_int("database.pool_size"))       # 20
+    print(config.get_int("api.port"))                 # 8080
+
+    # With a default — if the path is missing, the supplied default is returned:
+    print(config.get_int("api.max_body_mb", default=10))  # 10
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { Config } from "@dagstack/config";
+
+    const config = await Config.load("app-config.yaml");
+
+    console.log(config.getString("app.name"));            // "order-service"
+    console.log(config.getInt("database.pool_size"));     // 20
+    console.log(config.getInt("api.port"));               // 8080
+
+    console.log(config.getInt("api.max_body_mb", 10));    // 10
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    import (
+        "context"
+        "go.dagstack.dev/config"
+    )
+
+    cfg, err := config.Load(context.Background(), "app-config.yaml")
+    if err != nil {
+        return err
+    }
+
+    name, _ := cfg.GetString("app.name")               // "order-service"
+    pool, _ := cfg.GetInt("database.pool_size")        // 20
+    port, _ := cfg.GetInt("api.port")                  // 8080
+
+    maxBody, _ := cfg.GetIntDefault("api.max_body_mb", 10)  // 10
+    ```
+  </TabItem>
+</Tabs>
+
+## Typed access
+
+Instead of a series of `get_string` / `get_int` (Python), `getString` / `getInt` (TS), `GetString` / `GetInt` (Go) calls, declare a section as a model and load it as a whole, with validation.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from pydantic import BaseModel, Field
+    from dagstack.config import Config
+
+
+    class DatabaseConfig(BaseModel):
+        host: str
+        port: int = Field(5432, ge=1, le=65535)
+        name: str
+        user: str
+        password: str = Field(..., min_length=1)
+        pool_size: int = Field(20, ge=1, le=1000)
+
+
+    config = Config.load("app-config.yaml")
+    db = config.get_section("database", DatabaseConfig)
+    # Attribute-based access, with validation:
+    pool = create_pool(host=db.host, port=db.port, pool_size=db.pool_size)
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { z } from "zod";
+    import { Config } from "@dagstack/config";
+
+    const DatabaseConfig = z.object({
+      host: z.string(),
+      port: z.number().int().min(1).max(65535).default(5432),
+      name: z.string(),
+      user: z.string(),
+      password: z.string().min(1),
+      pool_size: z.number().int().min(1).max(1000).default(20),
+    });
+
+    const config = await Config.load("app-config.yaml");
+    const db = config.getSection("database", DatabaseConfig);
+    const pool = createPool({ host: db.host, port: db.port, poolSize: db.pool_size });
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    type DatabaseConfig struct {
+        Host     string `yaml:"host"`
+        Port     int    `yaml:"port" validate:"min=1,max=65535"`
+        Name     string `yaml:"name"`
+        User     string `yaml:"user"`
+        Password string `yaml:"password" validate:"required"`
+        PoolSize int    `yaml:"pool_size" validate:"min=1,max=1000"`
+    }
+
+    cfg, _ := config.Load(context.Background(), "app-config.yaml")
+    var db DatabaseConfig
+    if err := cfg.GetSection("database", &db); err != nil {
+        return err
+    }
+    pool := createPool(db.Host, db.Port, db.PoolSize)
+    ```
+  </TabItem>
+</Tabs>
+
+Schema validation runs immediately inside `getSection`; on failure, you get a `ConfigError(validation_failed)` with the offending field.
+
+## Reloading the config at runtime
+
+If the configuration source supports watching (typically `YamlFileSource` via fsnotify), components can subscribe to changes for their section:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    sub = config.on_section_change("database", DatabaseConfig, callback=lambda new: apply_pool(new))
+    # ... do work ...
+    sub.unsubscribe()
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    const sub = config.onSectionChange("database", DatabaseConfig, (newConfig) => applyPool(newConfig));
+    // ...
+    sub.unsubscribe();
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    sub, _ := cfg.OnSectionChange("database", &DatabaseConfig{}, func(newCfg any) { applyPool(newCfg.(*DatabaseConfig)) })
+    defer sub.Unsubscribe()
+    ```
+  </TabItem>
+</Tabs>
+
+If the source cannot watch for changes, the subscription is still accepted, but `active = false` with `inactive_reason = "subscription_without_watch"`. The component code does not break — the callback simply never fires.
+
+## Which applications fit
+
+dagstack/config is domain-agnostic. It works equally well for:
+
+- **Web and API services** — sections like `database`, `cache`, `api`, `auth`, `rate_limit`, `workers`.
+- **Data pipelines** — sections like `source`, `processor`, `sink`, `scheduler`, `retry_policy`.
+- **Workflow orchestrators** — sections like `queue`, `executor`, `storage`, `retry`.
+- **AI / RAG platforms** — sections like `llm`, `embedder`, `vector_store`, `retrieval`.
+- **Notification systems** — sections like `email`, `sms`, `push`, `webhook`.
+- **Billing / payment services** — sections like `payment_provider`, `tax`, `subscriptions`.
+
+The mechanics are identical: declare a section in YAML, describe its schema in your language's native format, and read it via `getSection()`. Domain knowledge lives in the application, not in the config stack.
+
+## What to read next
+
+**Concepts** — how the config stack is built:
+
+- [Sources (ConfigSource)](./concepts/sources), [Layers](./concepts/layers), [Env substitution](./concepts/substitution).
+- [Secrets](./concepts/secrets), [Hot reload (watch)](./concepts/watch).
+
+**Guides** — how to solve typical tasks:
+
+- [Declare a section](./guides/declaring-section), [Testing](./guides/testing).
+
+**Reference** — precise tables:
+
+- [YAML schema](./reference/yaml-schema), [Error taxonomy](./reference/errors).
+
+**Specification** — normative decisions:
+
+- [Overview](./spec/overview), [ADR-0001: YAML configuration](./spec/adr/0001-yaml-configuration).
+
+**API** (generation deferred until the implementations stabilize):
+
+- [Python](./api/python) — being prepared via `pydoc-markdown`.

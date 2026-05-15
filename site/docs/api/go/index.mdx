@@ -1,0 +1,142 @@
+---
+sidebar_position: 1
+title: Go API — overview
+description: Navigation for the public API of the go.dagstack.dev/config module — Config, sources, errors, the ADR-0002 secrets surface (SecretSource, SecretRef, SecretValue, EnvSecretSource, vault.Source).
+slug: /api/go
+---
+
+# Go API — overview
+
+The reference is generated automatically from the doc comments of
+the `go.dagstack.dev/config` Go module.
+
+:::info Primary source — pkg.go.dev
+The canonical godoc for Go consumers is
+[pkg.go.dev/go.dagstack.dev/config](https://pkg.go.dev/go.dagstack.dev/config)
+and
+[pkg.go.dev/go.dagstack.dev/config/vault](https://pkg.go.dev/go.dagstack.dev/config/vault).
+The markdown copy on this site is secondary; it exists so docs share
+a single search index and so context7 can index the package for LLM
+agents. The copy is produced by
+[gomarkdoc](https://github.com/princjef/gomarkdoc).
+:::
+
+:::info Generation deferred
+The pages have not been generated for this initial release. Run them
+with `make api-go` (the target will land once the gomarkdoc pipeline
+is integrated). Until then, this page lists the canonical types and
+their import paths so context7 and IDE-fed autocompletion can find
+them.
+:::
+
+## Install
+
+```bash
+go get go.dagstack.dev/config
+
+# Phase 2 Vault adapter (ADR-0002 §6) — separate sub-module:
+go get go.dagstack.dev/config/vault
+```
+
+The Vault adapter lives in a separate Go module so that the
+official `github.com/hashicorp/vault/api` dependency does not leak
+into binaries that use only file sources. Import it under
+`go.dagstack.dev/config/vault`.
+
+## Reference contents
+
+### Phase 1 — base API (ADR-0001)
+
+| Module / symbol | What it covers |
+|---|---|
+| `go.dagstack.dev/config.Config` (struct) | Main type — `Load`, `LoadFrom`, `LoadPaths`; primitive getters (`Get`, `GetString`, `GetInt`, `GetNumber`, `GetBool`, `GetList`, `Has`); the `*Default` companions; `GetSection(path, &target)`. |
+| `go.dagstack.dev/config.Error`, `ErrorReason` | Structured error type — `Path`, `Reason`, `Details`, `SourceID`, `Wrapped`. Stutter-avoidance: `config.Error` (not `config.ConfigError`). |
+| `go.dagstack.dev/config.Source` (interface) | Source adapter contract — `ID() string`, `Load() (Tree, error)`. Stutter-avoidance: `config.Source` (not `config.ConfigSource`). |
+| `go.dagstack.dev/config.YamlFileSource`, `JsonFileSource`, `NewDictSource`, `DictSource` | Built-in Phase 1 sources. `DictSource` is the in-memory variant (idiom carry-over from `YamlFileSource` / `JsonFileSource`). |
+| `go.dagstack.dev/config.Subscription` | Handle for change subscriptions (Phase 1 — inactive). |
+| `go.dagstack.dev/config.IsSecretField`, `MaskValue`, `MaskedPlaceholder` | Field-name auto-masking. |
+
+### Phase 2 — secrets surface (ADR-0002)
+
+| Module / symbol | What it covers |
+|---|---|
+| `go.dagstack.dev/config.SecretSource` (interface) | Adapter contract — `Scheme() string`, `ID() string`, `Resolve(ctx, path) (SecretValue, error)`, `Close() error`. |
+| `go.dagstack.dev/config.AsyncSecretSource` (type alias) | Equal to `SecretSource` — Go's `context.Context` already encodes async semantics through cancellation, so a single interface covers both. Re-exported for cross-binding parity. |
+| `go.dagstack.dev/config.SecretRef` (struct) | Opaque placeholder — `Scheme`, `Path`, `Default *string`, `OriginSource`. |
+| `go.dagstack.dev/config.SecretValue` (struct) | Result of `Resolve` — `Value string`, `SourceID string`, `Version string`, `ExpiresAt time.Time`. Zero values mean "not set" (no version, no expiry). |
+| `go.dagstack.dev/config.EnvSecretSource` (struct) | Mandatory in-process adapter for the `env` scheme. `Lookup func(name string) (string, bool)` — `nil` falls back to `os.LookupEnv`. Constructor: `NewEnvSecretSource()`. |
+| `go.dagstack.dev/config/vault.Source` (struct) | Pilot adapter for HashiCorp Vault KV v2. Stutter-avoidance: `vault.Source`, not `vault.VaultSource`. Constructor: `vault.NewSource(addr, auth, opts...)`. |
+| `go.dagstack.dev/config/vault.Auth` (interface) | Discriminated union of supported auth methods. |
+| `go.dagstack.dev/config/vault.TokenAuth`, `AppRoleAuth`, `KubernetesAuth` (structs) | Auth descriptors. Implement `Auth` via an unexported marker. |
+| `go.dagstack.dev/config/vault.Option`, `WithNamespace`, `WithTLSConfig` | Functional options for `NewSource`. |
+
+### `Config` Phase 2 methods
+
+- `config.LoadFrom(ctx context.Context, sources []Source, opts ...LoadOption) (*Config, error)`
+  — accepts a heterogeneous slice of `Source` (the `ConfigSource`
+  interface) and `SecretSource` instances. **Eager** resolution:
+  every `${secret:...}` reference resolves before `LoadFrom`
+  returns. Auto-registers `EnvSecretSource` when none is passed.
+- `(c *Config) RefreshSecrets(ctx context.Context) error` — re-walks
+  the original tree against the registered `SecretSource` instances;
+  swaps in the resolved tree atomically on success.
+- `(c *Config) Snapshot(opts ...SnapshotOption) Tree` — masked
+  diagnostic dump. Default walks the original (pre-resolution) tree
+  and masks every `SecretRef`. With `config.WithIncludeSecrets()`,
+  walks the resolved tree and applies field-name suffix masking only.
+
+## Go idiom
+
+- **Naming** — `PascalCase` for the public API. Default-value
+  getters use the `Default` suffix (`GetStringDefault(path, def)`)
+  rather than overloading `GetString` with a variadic default;
+  signatures stay unambiguous.
+- **Stutter-avoidance** — `config.Error` (not `ConfigError`),
+  `config.Source` (not `ConfigSource`), `vault.Source` (not
+  `vault.VaultSource`). The secret-related types keep the `Secret*`
+  prefix because the Phase 2 binding does not extract them to a
+  sub-package (`config.SecretSource` does not stutter: the package
+  is `config`, the prefix is `Secret`). A future `config/secret`
+  sub-package would rename to `secret.Source` per the spec
+  `_meta/types.yaml` row.
+- **No `SecretScheme` enum** — schemes are plain lowercase strings;
+  the constants `ReasonSecretUnresolved` /
+  `ReasonSecretBackendUnavailable` /
+  `ReasonSecretPermissionDenied` cover the error side. The scheme
+  registry lives in `config-spec/_meta/secret_schemes.yaml`.
+- **`context.Context` first** — `LoadFrom`, `Resolve`,
+  `RefreshSecrets` all take `ctx context.Context` as the first
+  parameter, per Go convention.
+- **Functional options** — `NewSource(addr, auth, vault.WithNamespace("dagstack/prod"))`.
+  Keeps the constructor signature stable while new optional
+  parameters land.
+- **Zero values for absence** — `SecretValue.Version` is an empty
+  string when the backend does not version; `SecretValue.ExpiresAt`
+  is the zero `time.Time` when there is no expiry. Cleaner than
+  pointer fields for value-type result objects.
+
+## Generating the reference locally
+
+```bash
+cd config-go
+git submodule update --init
+go doc ./...                       # standard godoc in the terminal
+go install github.com/princjef/gomarkdoc/cmd/gomarkdoc@latest
+gomarkdoc -o docs/api.md ./...     # markdown copy
+gomarkdoc -o docs/vault.md ./vault # vault sub-module copy
+```
+
+## Until the reference is generated
+
+- `go doc go.dagstack.dev/config` and
+  `go doc go.dagstack.dev/config/vault` print the API in the
+  terminal.
+- Public `godoc` on
+  [pkg.go.dev/go.dagstack.dev/config](https://pkg.go.dev/go.dagstack.dev/config).
+- Guide pages: [Declare a section](/docs/guides/declaring-section),
+  [Testing](/docs/guides/testing).
+- Concept pages: [Secrets](/docs/concepts/secrets),
+  [Secret sources](/docs/concepts/secret-sources).
+- Specification:
+  [ADR-0001](/docs/spec/adr/0001-yaml-configuration),
+  [ADR-0002](/docs/spec/adr/0002-secret-references-and-sources).

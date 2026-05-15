@@ -1,0 +1,384 @@
+---
+sidebar_position: 1
+title: Объявление секции
+description: Как компонент приложения объявляет свою секцию конфигурации — схема, getSection, валидация, изоляция от других секций.
+slug: /guides/declaring-section
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Объявление секции конфигурации
+
+Каждый компонент / плагин / сервис в приложении должен объявить **свою секцию** конфигурации — ключ верхнего уровня в YAML и схему, которая ему соответствует.
+
+## Шаг 1. Выбери имя секции
+
+Соглашения по именованию:
+
+| Рекомендация | Пример |
+|---|---|
+| `snake_case` | `database`, `payment_provider`, `rate_limit` |
+| Существительное в единственном числе | `database`, не `databases` |
+| Без суффиксов `_config` / `_settings` | `database`, не `database_config` |
+| Коротко, но уникально | 2–3 слова через `_` |
+
+Для плагинов имя секции нормативно: **`<kind>.<name>`** ([ADR-0001 §4](../spec/adr/0001-yaml-configuration)).
+
+## Шаг 2. Опиши схему
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="app/database.py"
+    from pydantic import BaseModel, Field, field_validator
+
+
+    class DatabaseConfig(BaseModel):
+        host: str
+        port: int = Field(5432, ge=1, le=65535)
+        name: str
+        user: str
+        password: str = Field(..., min_length=1)
+        pool_size: int = Field(20, ge=1, le=1000)
+        ssl: bool = False
+
+        @field_validator("host")
+        @classmethod
+        def must_not_be_wildcard(cls, v: str) -> str:
+            if v in ("0.0.0.0", "*"):
+                raise ValueError("host must be a concrete address")
+            return v
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts title="app/database.ts"
+    import { z } from "zod";
+
+    export const DatabaseConfig = z.object({
+      host: z.string().refine(
+        (v) => v !== "0.0.0.0" && v !== "*",
+        "host must be a concrete address",
+      ),
+      port: z.number().int().min(1).max(65535).default(5432),
+      name: z.string(),
+      user: z.string(),
+      password: z.string().min(1),
+      pool_size: z.number().int().min(1).max(1000).default(20),
+      ssl: z.boolean().default(false),
+    });
+
+    export type DatabaseConfig = z.infer<typeof DatabaseConfig>;
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="app/database.go"
+    type DatabaseConfig struct {
+        Host     string `yaml:"host" validate:"required,ne=0.0.0.0"`
+        Port     int    `yaml:"port" validate:"min=1,max=65535"`
+        Name     string `yaml:"name" validate:"required"`
+        User     string `yaml:"user" validate:"required"`
+        Password string `yaml:"password" validate:"required,min=1"`
+        PoolSize int    `yaml:"pool_size" validate:"min=1,max=1000"`
+        SSL      bool   `yaml:"ssl"`
+    }
+
+    func defaultDatabaseConfig() DatabaseConfig {
+        return DatabaseConfig{
+            Port:     5432,
+            PoolSize: 20,
+            SSL:      false,
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Требования к схеме:
+
+- **Каждое обязательное поле** явно помечено (`Field(...)` без default в pydantic; `z.string()` без `.default()` в zod; `validate:"required"` в struct-теге Go).
+- **Значения по умолчанию** прописаны для каждого опционального поля.
+- **Валидация диапазонов** (min / max / pattern) — декларативно, чтобы не прописывать её в рантайме.
+- **Типизированные поля** — избегай `Any` / `unknown`; у каждого поля явный тип.
+
+## Шаг 3. Прочитай секцию
+
+Имя метода различается по биндингам (`get_section` / `getSection` / `GetSection`):
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.config import Config
+
+    config = Config.load("app-config.yaml")
+    db_cfg = config.get_section("database", DatabaseConfig)
+    # db_cfg — экземпляр DatabaseConfig, уже провалидированный.
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { Config } from "@dagstack/config";
+
+    const config = await Config.load("app-config.yaml");
+    const dbCfg = config.getSection("database", DatabaseConfigSchema);
+    // dbCfg — значение z.infer<typeof DatabaseConfigSchema>, уже провалидированное.
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    cfg, _ := config.Load(context.Background(), "app-config.yaml")
+    dbCfg := defaultDatabaseConfig()
+    if err := cfg.GetSection("database", &dbCfg); err != nil {
+        return err
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Метод:
+
+1. Извлекает поддерево по заданному пути.
+2. Запускает валидацию по схеме.
+3. Возвращает типизированный объект.
+
+При сбое → `ConfigError(validation_failed)` с указанием поля, ожидаемого типа и фактического значения (с маскированными секретными полями).
+
+## Шаг 4. Изоляция — читай только свою секцию
+
+**Правило:** компонент читает **только свою** секцию. Чтение чужой секции — антипаттерн.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    # Правильно — внутри сервиса базы данных:
+    db_cfg = config.get_section("database", DatabaseConfig)
+
+    # Неправильно — сервис БД читает чужую секцию:
+    cache_cfg = config.get_section("cache", CacheConfig)
+    # Сервис БД теперь зависит от структуры cache.
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    // Правильно — внутри сервиса базы данных:
+    const dbCfg = config.getSection("database", DatabaseConfigSchema);
+
+    // Неправильно — сервис БД читает чужую секцию:
+    const cacheCfg = config.getSection("cache", CacheConfigSchema);
+    // Сервис БД теперь зависит от структуры cache.
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    // Правильно — внутри сервиса базы данных:
+    var dbCfg DatabaseConfig
+    _ = cfg.GetSection("database", &dbCfg)
+
+    // Неправильно — сервис БД читает чужую секцию:
+    var cacheCfg CacheConfig
+    _ = cfg.GetSection("cache", &cacheCfg)
+    // Сервис БД теперь зависит от структуры cache.
+    ```
+  </TabItem>
+</Tabs>
+
+Почему:
+
+- **Связанность.** Если сервис A читает конфиг сервиса B, изменение схемы B ломает A. Скрытая зависимость без явных границ.
+- **Тестируемость.** Замокать только секцию `database` проще, чем мокать весь конфиг с секциями всех компонентов.
+- **Безопасность.** В production у сервисов могут быть разные права на чтение разных секций (через governance-middleware); жёстко зашитое чтение чужой секции обходит эту политику.
+
+**Правильная альтернатива:** если двум сервисам нужен общий параметр (например, общий `max_payload_mb`), вынеси его в отдельную секцию `shared` и читай из обеих:
+
+```yaml
+shared:
+  max_payload_mb: 10
+
+database:
+  host: "localhost"
+  pool_size: 20
+
+api:
+  host: "0.0.0.0"
+  port: 8080
+```
+
+## Шаг 5. Значения по умолчанию для опциональных полей
+
+Все опциональные поля объявляют свои значения по умолчанию **в схеме**, не в коде:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    class DatabaseConfig(BaseModel):
+        host: str                                # обязательное
+        user: str                                # обязательное
+        password: str                            # обязательное
+        port: int = 5432                         # default в схеме
+        pool_size: int = 20                      # default в схеме
+        ssl: bool = False                        # default в схеме
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    const DatabaseConfigSchema = z.object({
+      host: z.string(),                          // обязательное
+      user: z.string(),                          // обязательное
+      password: z.string(),                      // обязательное
+      port: z.number().int().default(5432),     // default в схеме
+      pool_size: z.number().int().default(20),  // default в схеме
+      ssl: z.boolean().default(false),           // default в схеме
+    });
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    // В Go значения по умолчанию задаются заполнением структуры с нулевыми значениями ДО GetSection.
+    // GetSection заполняет только те поля, что есть в YAML — остальные сохраняют исходные значения.
+    dbCfg := DatabaseConfig{
+        Port:     5432,
+        PoolSize: 20,
+        SSL:      false,
+    }
+    _ = cfg.GetSection("database", &dbCfg)
+    // host/user/password — обязательные (валидируются внешне или через
+    // struct-теги go-playground/validator).
+    ```
+  </TabItem>
+</Tabs>
+
+Антипаттерн — навязывание значений по умолчанию в коде после чтения:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    # НЕПРАВИЛЬНО — defaults в коде:
+    cfg = config.get_section("database", DatabaseConfig)
+    port = cfg.port or 5432                      # ← такой default делает схему нечестной
+    pool = cfg.pool_size or 20
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    // НЕПРАВИЛЬНО — defaults в коде:
+    const cfg = config.getSection("database", DatabaseConfigSchema);
+    const port = cfg.port ?? 5432;               // ← такой default делает схему нечестной
+    const pool = cfg.pool_size ?? 20;
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    // НЕПРАВИЛЬНО — defaults в коде после вызова:
+    var cfg DatabaseConfig
+    _ = config.GetSection("database", &cfg)
+    if cfg.Port == 0 { cfg.Port = 5432 }         // ← схема нечестна
+    if cfg.PoolSize == 0 { cfg.PoolSize = 20 }
+    ```
+  </TabItem>
+</Tabs>
+
+Если default задан в схеме, `get_section` / `getSection` / `GetSection` всегда возвращает полностью заполненный объект. Коду не приходится угадывать.
+
+## Шаг 6. Документируй секцию
+
+Каждая секция должна быть задокументирована:
+
+- **Описание для каждого поля** — комментарий / docstring в схеме.
+- **Пример конфига** — фрагмент `app-config.yaml` в README компонента.
+- **Заметки про диапазоны** — почему `pool_size` ограничен интервалом 1–1000, а не безграничен сверху.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    class DatabaseConfig(BaseModel):
+        """Configuration for application database connection.
+
+        Note: password is masked in diagnostic output automatically.
+        """
+
+        host: str = Field(
+            ...,
+            description="Database server host.",
+            examples=["localhost", "db.internal.example.com"],
+        )
+        port: int = Field(
+            5432,
+            description="TCP port of the database server.",
+            ge=1,
+            le=65535,
+        )
+        pool_size: int = Field(
+            20,
+            description="Connection pool size. Range: 1-1000. Typical dev: 5-10, prod: 50-200.",
+            ge=1,
+            le=1000,
+        )
+    ```
+
+    `description` / `examples` в `pydantic.Field` попадают в JSON-схему,
+    которая дальше всплывает в подсказках IDE и в авто-генерируемой документации.
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    /**
+     * Configuration for application database connection.
+     * Note: password is masked in diagnostic output automatically.
+     */
+    const DatabaseConfigSchema = z.object({
+      host: z
+        .string()
+        .describe("Database server host, e.g. 'localhost' or 'db.internal.example.com'."),
+      port: z
+        .number()
+        .int()
+        .min(1)
+        .max(65535)
+        .default(5432)
+        .describe("TCP port of the database server."),
+      pool_size: z
+        .number()
+        .int()
+        .min(1)
+        .max(1000)
+        .default(20)
+        .describe("Connection pool size. Typical dev: 5-10, prod: 50-200."),
+    });
+
+    type DatabaseConfig = z.infer<typeof DatabaseConfigSchema>;
+    ```
+
+    Метаданные `.describe()` из `zod` доступны через
+    `DatabaseConfigSchema._def.description` и попадают в конвертер
+    `zod-to-json-schema`, на котором строится авто-генерируемая документация.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    // DatabaseConfig — configuration for application database connection.
+    //
+    // Note: password is masked in diagnostic output automatically.
+    type DatabaseConfig struct {
+        // Host is the database server host, e.g. "localhost" or
+        // "db.internal.example.com".
+        Host string `yaml:"host" validate:"required"`
+
+        // Port is the TCP port of the database server. Range: 1-65535.
+        Port int `yaml:"port" validate:"gte=1,lte=65535" default:"5432"`
+
+        // PoolSize is the connection pool size. Typical dev: 5-10,
+        // prod: 50-200. Range: 1-1000.
+        PoolSize int `yaml:"pool_size" validate:"gte=1,lte=1000" default:"20"`
+    }
+    ```
+
+    Doc-комментарии Go автоматически показываются в `go doc` /
+    `pkg.go.dev` / подсказках IDE. Struct-теги (`validate:` / `default:`)
+    читаются `go-playground/validator` + `creasty/defaults` во время
+    `GetSection(path, &dbCfg)`.
+  </TabItem>
+</Tabs>
+
+## См. также
+
+- [Подстановка переменных окружения](../concepts/substitution) — как секретные поля приходят из env.
+- [Секреты](../concepts/secrets) — автоматическое маскирование password / *_token / *_key.
+- [Руководство: Тестирование](./testing) — как тестировать секцию с мок-конфигурацией.
+- [ADR-0001 §4 API доступа к конфигурации](../spec/adr/0001-yaml-configuration) — нормативный контракт `getSection`.

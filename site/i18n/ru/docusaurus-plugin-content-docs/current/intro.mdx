@@ -1,0 +1,279 @@
+---
+sidebar_position: 1
+title: Быстрый старт
+description: Установи dagstack/config и прочитай свой первый иерархический YAML-конфиг — секции, переменные окружения, типизированный доступ в Python, TypeScript, Go.
+slug: /intro
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Быстрый старт
+
+`dagstack/config` — это универсальный иерархический стек конфигурации для приложений любой предметной области (веб-сервисы, дата-пайплайны, оркестраторы воркфлоу, AI-платформы). Он даёт:
+
+- **YAML как единый формат передачи** — один и тот же файл одинаково читается из Python, TypeScript и Go.
+- **Слои конфигурации** — `app-config.yaml` (база) → `app-config.local.yaml` (переопределения разработчика) → `app-config.${DAGSTACK_ENV}.yaml` (переопределения окружения).
+- **Подстановку переменных окружения** — `${VAR}` / `${VAR:-default}` интерполируется при загрузке.
+- **Типизированный доступ** — `get_section` / `getSection` / `GetSection` (в зависимости от языка) с pydantic / zod / struct-тегами под капотом.
+- **Маскирование секретов** — поля с именами вроде `api_key`, `*_token`, `*_password` автоматически исключаются из диагностических логов.
+- **Горячую перезагрузку** — подписка через `on_section_change` / `onSectionChange` / `OnSectionChange` (в зависимости от языка) без перезапуска процесса.
+
+:::info Статус релиза
+Python- и TypeScript-пакеты готовятся к публикации на PyPI и npmjs.org. Сейчас они доступны из внутреннего репозитория. Go-биндинг — в плане; примеры ниже показывают будущую сигнатуру.
+:::
+
+## Установка
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```bash
+    pip install dagstack-config
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```bash
+    npm install @dagstack/config
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```bash
+    go get go.dagstack.dev/config
+    ```
+  </TabItem>
+</Tabs>
+
+## Первая конфигурация
+
+Создай базовый файл `app-config.yaml` в корне приложения. Подстановки `${...}` берут значения из переменных окружения на момент загрузки; без `:-default` отсутствие переменной приводит к ошибке.
+
+```yaml title="app-config.yaml"
+app:
+  name: "order-service"
+  tagline: "Order processor"
+
+database:
+  host: "${DB_HOST:-localhost}"
+  port: "${DB_PORT:-5432}"
+  name: "${DB_NAME:-orders}"
+  user: "${DB_USER}"
+  password: "${DB_PASSWORD}"
+  pool_size: 20
+
+cache:
+  url: "${REDIS_URL:-redis://localhost:6379/0}"
+  ttl_min: 15
+
+api:
+  host: "0.0.0.0"
+  port: 8080
+  request_timeout_s: 30
+```
+
+Локальные переопределения кладутся в `app-config.local.yaml` (этот файл указан в `.gitignore`):
+
+```yaml title="app-config.local.yaml"
+database:
+  pool_size: 5         # меньше соединений локально
+
+api:
+  request_timeout_s: 120   # медленный отладчик
+```
+
+Переопределения для конкретного окружения кладутся в `app-config.production.yaml` (коммитится):
+
+```yaml title="app-config.production.yaml"
+database:
+  host: "prod-db.internal.example.com"
+  pool_size: 100
+
+cache:
+  url: "redis://prod-cache.internal.example.com:6379/0"
+```
+
+При `DAGSTACK_ENV=production` загрузчик читает все три файла в порядке `база → local → production`, делает глубокое слияние и возвращает итоговый `Config`.
+
+## Загрузка и чтение
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.config import Config
+
+    config = Config.load("app-config.yaml")
+
+    # Базовые геттеры:
+    print(config.get_string("app.name"))              # "order-service"
+    print(config.get_int("database.pool_size"))       # 20
+    print(config.get_int("api.port"))                 # 8080
+
+    # Со значением по умолчанию — если путь отсутствует, возвращается переданное значение:
+    print(config.get_int("api.max_body_mb", default=10))  # 10
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { Config } from "@dagstack/config";
+
+    const config = await Config.load("app-config.yaml");
+
+    console.log(config.getString("app.name"));            // "order-service"
+    console.log(config.getInt("database.pool_size"));     // 20
+    console.log(config.getInt("api.port"));               // 8080
+
+    console.log(config.getInt("api.max_body_mb", 10));    // 10
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    import (
+        "context"
+        "go.dagstack.dev/config"
+    )
+
+    cfg, err := config.Load(context.Background(), "app-config.yaml")
+    if err != nil {
+        return err
+    }
+
+    name, _ := cfg.GetString("app.name")               // "order-service"
+    pool, _ := cfg.GetInt("database.pool_size")        // 20
+    port, _ := cfg.GetInt("api.port")                  // 8080
+
+    maxBody, _ := cfg.GetIntDefault("api.max_body_mb", 10)  // 10
+    ```
+  </TabItem>
+</Tabs>
+
+## Типизированный доступ
+
+Вместо череды вызовов `get_string` / `get_int` (Python), `getString` / `getInt` (TS), `GetString` / `GetInt` (Go) объяви секцию как модель и прочитай её целиком — с валидацией.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from pydantic import BaseModel, Field
+    from dagstack.config import Config
+
+
+    class DatabaseConfig(BaseModel):
+        host: str
+        port: int = Field(5432, ge=1, le=65535)
+        name: str
+        user: str
+        password: str = Field(..., min_length=1)
+        pool_size: int = Field(20, ge=1, le=1000)
+
+
+    config = Config.load("app-config.yaml")
+    db = config.get_section("database", DatabaseConfig)
+    # Доступ через атрибуты, с валидацией:
+    pool = create_pool(host=db.host, port=db.port, pool_size=db.pool_size)
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { z } from "zod";
+    import { Config } from "@dagstack/config";
+
+    const DatabaseConfig = z.object({
+      host: z.string(),
+      port: z.number().int().min(1).max(65535).default(5432),
+      name: z.string(),
+      user: z.string(),
+      password: z.string().min(1),
+      pool_size: z.number().int().min(1).max(1000).default(20),
+    });
+
+    const config = await Config.load("app-config.yaml");
+    const db = config.getSection("database", DatabaseConfig);
+    const pool = createPool({ host: db.host, port: db.port, poolSize: db.pool_size });
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    type DatabaseConfig struct {
+        Host     string `yaml:"host"`
+        Port     int    `yaml:"port" validate:"min=1,max=65535"`
+        Name     string `yaml:"name"`
+        User     string `yaml:"user"`
+        Password string `yaml:"password" validate:"required"`
+        PoolSize int    `yaml:"pool_size" validate:"min=1,max=1000"`
+    }
+
+    cfg, _ := config.Load(context.Background(), "app-config.yaml")
+    var db DatabaseConfig
+    if err := cfg.GetSection("database", &db); err != nil {
+        return err
+    }
+    pool := createPool(db.Host, db.Port, db.PoolSize)
+    ```
+  </TabItem>
+</Tabs>
+
+Валидация схемы запускается прямо внутри `getSection`; при сбое получаешь `ConfigError(validation_failed)` с указанием проблемного поля.
+
+## Перезагрузка конфигурации в рантайме
+
+Если источник конфигурации поддерживает наблюдение за изменениями (обычно `YamlFileSource` через fsnotify), компоненты могут подписаться на изменения своей секции:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    sub = config.on_section_change("database", DatabaseConfig, callback=lambda new: apply_pool(new))
+    # ... выполняется работа ...
+    sub.unsubscribe()
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    const sub = config.onSectionChange("database", DatabaseConfig, (newConfig) => applyPool(newConfig));
+    // ...
+    sub.unsubscribe();
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    sub, _ := cfg.OnSectionChange("database", &DatabaseConfig{}, func(newCfg any) { applyPool(newCfg.(*DatabaseConfig)) })
+    defer sub.Unsubscribe()
+    ```
+  </TabItem>
+</Tabs>
+
+Если источник не умеет следить за изменениями, подписка всё равно принимается, но `active = false` и `inactive_reason = "subscription_without_watch"`. Код компонента не ломается — callback просто никогда не сработает.
+
+## Каким приложениям подходит
+
+dagstack/config предметно-нейтрален. Он одинаково годится для:
+
+- **Веб- и API-сервисов** — секции `database`, `cache`, `api`, `auth`, `rate_limit`, `workers`.
+- **Дата-пайплайнов** — секции `source`, `processor`, `sink`, `scheduler`, `retry_policy`.
+- **Оркестраторов воркфлоу** — секции `queue`, `executor`, `storage`, `retry`.
+- **AI- / RAG-платформ** — секции `llm`, `embedder`, `vector_store`, `retrieval`.
+- **Систем уведомлений** — секции `email`, `sms`, `push`, `webhook`.
+- **Биллинговых / платёжных сервисов** — секции `payment_provider`, `tax`, `subscriptions`.
+
+Механика везде одинаковая: объяви секцию в YAML, опиши её схему в нативном для языка формате, прочитай через `getSection()`. Знание предметной области остаётся в приложении, а не в стеке конфигурации.
+
+## Что читать дальше
+
+**Концепции** — как устроен стек конфигурации:
+
+- [Источники (ConfigSource)](./concepts/sources), [Слои](./concepts/layers), [Подстановка переменных окружения](./concepts/substitution).
+- [Секреты](./concepts/secrets), [Горячая перезагрузка (watch)](./concepts/watch).
+
+**Руководства** — как решать типичные задачи:
+
+- [Объявление секции](./guides/declaring-section), [Тестирование](./guides/testing).
+
+**Справочник** — точные таблицы:
+
+- [Структура YAML](./reference/yaml-schema), [Таксономия ошибок](./reference/errors).
+
+**Спецификация** — нормативные решения:
+
+- [Обзор](./spec/overview), [ADR-0001: YAML-конфигурация](./spec/adr/0001-yaml-configuration).
+
+**API** (генерация отложена до стабилизации реализаций):
+
+- [Python](./api/python) — готовится через `pydoc-markdown`.

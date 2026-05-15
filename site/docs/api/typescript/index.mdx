@@ -1,0 +1,126 @@
+---
+sidebar_position: 1
+title: TypeScript API — overview
+description: Navigation for the public API of the @dagstack/config package — Config, sources, errors, the ADR-0002 secrets surface (SecretSource, SecretRef, SecretValue, EnvSecretSource, VaultSource).
+slug: /api/typescript
+---
+
+# TypeScript API — overview
+
+The reference is generated automatically from the `@dagstack/config`
+npm package source through [TypeDoc](https://typedoc.org/) plus the
+markdown plugin.
+
+:::info Generation deferred
+The pages have not been generated for this initial release. Run them
+with `make api-typescript` (the target will land in the `Makefile`
+once the TypeDoc pipeline is integrated). Until then, this page lists
+the canonical types and their import paths so context7 and IDE-fed
+autocompletion can find them.
+:::
+
+## Install
+
+```bash
+npm install @dagstack/config
+
+# Phase 2 Vault adapter (ADR-0002 §6) — optional peer dependency:
+npm install node-vault
+```
+
+`node-vault` is declared as an **optional peer dependency**
+(`peerDependenciesMeta.optional: true`); it is not installed
+transitively with `@dagstack/config`. Add it explicitly when you
+need `VaultSource`; otherwise the import path
+(`new VaultSource(...)`) throws at construction time with a hint to
+install it.
+
+## Reference contents
+
+### Phase 1 — base API (ADR-0001)
+
+| Symbol | What it covers |
+|---|---|
+| `Config` (class) | Main class — async static `load`, `loadFrom`, `loadPaths`; primitive getters; `getSection(schema)` (zod). |
+| `ConfigError`, `ConfigErrorReason`, `isConfigError`, `ConfigErrorInit` | Structured error type — `path`, `reason`, `details`, `sourceId?`. Reasons fixed in `config-spec/_meta/error_reasons.yaml`. |
+| `ConfigSource` (interface) | Source adapter contract — `id`, `load()`. |
+| `YamlFileSource`, `JsonFileSource`, `InMemorySource`, `FileSourceOptions` | Built-in Phase 1 sources. |
+| `Subscription` | Handle for change subscriptions (Phase 1 — inactive). |
+| `isSecretField`, `maskValue`, `MASKED_PLACEHOLDER` | Field-name auto-masking. |
+| `canonicalize`, `JsonValue` | Canonical-JSON serialisation (ADR-0001 §9.1.1). |
+| `interpolate`, `EnvMap` | Env-interpolation primitive. |
+| `deepMerge`, `deepMergeAll`, `ConfigTree`, `ConfigValue` | Merge primitive. |
+
+### Phase 2 — secrets surface (ADR-0002)
+
+| Symbol | What it covers |
+|---|---|
+| `SecretSource` (interface) | Adapter contract — `readonly scheme: string`, `readonly id: string`, `resolve(path, ctx): Promise<SecretValue>`, optional `close?(): Promise<void>`. |
+| `AsyncSecretSource` (type alias) | Equal to `SecretSource` — TypeScript already encodes async semantics through `Promise<T>`, so a single interface covers both. Re-exported for cross-binding parity. |
+| `SecretRef` (interface) | Opaque placeholder — `readonly __secretRef: true`, `scheme`, `path`, `default`, `originSource`. |
+| `makeSecretRef`, `isSecretRef` | Factory and type-guard for `SecretRef` leaves. |
+| `SecretValue` (interface) | Result of `resolve()` — `value: string`, `sourceId: string`, `version?: string`, `expiresAt?: Date`. |
+| `ResolveContext` (interface) | Per-call context — `attempt: number`, `deadline?: Date`, `signal?: AbortSignal`. |
+| `EnvSecretSource` (class) | Mandatory in-process adapter for the `env` scheme. `constructor(options?: { lookup?: EnvLookup })`. Auto-registered by the loader. |
+| `EnvLookup` (type) | `(name: string) => string \| undefined`. Test seam for `EnvSecretSource`. |
+| `VaultSource` (class) | Pilot adapter for HashiCorp Vault KV v2. `constructor(options: VaultSourceOptions)`. |
+| `VaultSourceOptions`, `TokenAuth`, `AppRoleAuth`, `KubernetesAuth`, `VaultAuth` | Construction descriptors. `VaultAuth` is a discriminated union (`kind: "token" \| "approle" \| "kubernetes"`). |
+
+### `Config` Phase 2 methods
+
+- `Config.loadFrom(sources)` — accepts a heterogeneous list of
+  `ConfigSource` and `SecretSource`. **Eager** resolution: every
+  `${secret:...}` reference resolves before the promise settles.
+  Auto-registers `EnvSecretSource` when none is passed.
+- `config.refreshSecrets()` — re-walks the original tree against
+  the registered `SecretSource` instances and swaps in the resolved
+  tree atomically on success.
+- `config.snapshot(options?: { includeSecrets?: boolean })` — masked
+  diagnostic dump. Default walks the original (pre-resolution) tree
+  and masks every `SecretRef`. With `includeSecrets: true`, walks the
+  resolved tree and applies field-name suffix masking only.
+
+## TypeScript idiom
+
+- **Naming** — `camelCase` for methods and interface fields. The
+  wire-format reasons stay `secret_unresolved` /
+  `secret_backend_unavailable` / `secret_permission_denied` (the
+  `ConfigErrorReason` const-object values match the spec).
+- **`ConfigErrorReason` is a const object**, not an enum — typed as a
+  union of its values. The const-object pattern is the preferred
+  TypeScript idiom for spec-fixed string constants since it avoids
+  the runtime weight of TS enums and keeps `isolatedModules`
+  compatibility.
+- **Eager-by-default** — `Config.loadFrom` always resolves secrets
+  before returning. There is no `eagerSecrets` flag in Phase 2; lazy
+  mode is not exposed (the Python binding's lazy default does not
+  carry over to a Promise-based API).
+- **Discriminated unions for auth** — `VaultAuth` uses the
+  `kind: "token" \| "approle" \| "kubernetes"` discriminator so the
+  compiler narrows `auth.roleId` only inside the `approle` branch.
+- **`AbortSignal`** is the cancellation primitive in `ResolveContext`
+  — adapters MAY honour it but the loader does not implement
+  automatic retries.
+
+## Generating the reference locally
+
+```bash
+cd config-typescript
+git submodule update --init
+npm install
+npm run docs      # once the TypeDoc pipeline is integrated
+```
+
+## Until the reference is generated
+
+- JSDoc from the source is visible in your IDE (VSCode / WebStorm /
+  Neovim with LSP).
+- `.d.ts` types are available after
+  `npm install @dagstack/config`.
+- Guide pages: [Declare a section](/docs/guides/declaring-section),
+  [Testing](/docs/guides/testing).
+- Concept pages: [Secrets](/docs/concepts/secrets),
+  [Secret sources](/docs/concepts/secret-sources).
+- Specification:
+  [ADR-0001](/docs/spec/adr/0001-yaml-configuration),
+  [ADR-0002](/docs/spec/adr/0002-secret-references-and-sources).

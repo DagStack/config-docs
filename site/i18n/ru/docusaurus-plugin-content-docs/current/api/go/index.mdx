@@ -1,0 +1,52 @@
+---
+sidebar_position: 1
+title: Go API — обзор
+description: Навигация по справочнику публичного API пакета go.dagstack.dev/config; страницы генерируются из docstring-комментариев модуля.
+slug: /api/go
+---
+
+# Go API — обзор
+
+Справочник генерируется автоматически из doc-комментариев Go-модуля
+`go.dagstack.dev/config`.
+
+:::info Основной источник — pkg.go.dev
+Канонический godoc для Go-потребителей —
+[pkg.go.dev/go.dagstack.dev/config](https://pkg.go.dev/go.dagstack.dev/config).
+Markdown-копия на этом сайте вторична; она нужна, чтобы у документации
+был единый поисковый индекс и чтобы context7 мог индексировать пакет
+для LLM-агентов. Копия делается через
+[gomarkdoc](https://github.com/princjef/gomarkdoc).
+:::
+
+:::info Генерация отложена
+Страницы для этого первого релиза не сгенерированы. Запуск — `make
+api-go` (target появится, как только gomarkdoc-пайплайн будет
+интегрирован). Содержимое появится в последующих коммитах, когда
+реализация стабилизируется.
+:::
+
+## Содержание справочника (планируется)
+
+| Модуль | Что покрывает |
+|---|---|
+| `go.dagstack.dev/config` | Публичный верхний уровень — `Config`, `Load`, `LoadFrom`, геттеры, ошибки. |
+| `go.dagstack.dev/config` — sources | Интерфейс `Source`, `YamlFileSource`, `JsonFileSource`, `DictSource`. |
+| `go.dagstack.dev/config` — errors | `Error`, `ErrorReason`. |
+
+## Локальная генерация
+
+```bash
+cd config-go
+git submodule update --init
+go doc ./...                   # стандартный godoc в терминале
+go install github.com/princjef/gomarkdoc/cmd/gomarkdoc@latest
+gomarkdoc -o docs/api.md ./... # markdown-копия
+```
+
+## Пока справочник не сгенерирован
+
+- `go doc go.dagstack.dev/config` печатает API в терминал.
+- Публичный `godoc` на pkg.go.dev появится, как только Go-модуль будет опубликован.
+- Страницы руководств: [Объявление секции](/docs/guides/declaring-section), [Тестирование](/docs/guides/testing).
+- Спецификация: [ADR-0001](/docs/spec/adr/0001-yaml-configuration).

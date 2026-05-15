@@ -1,0 +1,112 @@
+---
+sidebar_position: 1
+title: Python API — overview
+description: Navigation for the public API of the dagstack-config package — Config, sources, errors, the ADR-0002 secrets surface (SecretSource, SecretRef, SecretValue, EnvSecretSource, VaultSource).
+slug: /api/python
+---
+
+# Python API — overview
+
+The reference is generated automatically from the `dagstack-config`
+package source through
+[pydoc-markdown](https://niklasrosenstein.github.io/pydoc-markdown/).
+
+:::info Generation deferred
+The pages have not been generated for this initial release. The
+pipeline configuration lives in `pydoc-markdown.yaml` at the repo
+root; run it with `make api-python`. Until then, this page lists the
+canonical types and their import paths so context7 and IDE-fed
+autocompletion can find them.
+:::
+
+## Install
+
+```bash
+pip install dagstack-config
+
+# Phase 2 Vault adapter (ADR-0002 §6) — optional extra:
+pip install 'dagstack-config[vault]'
+```
+
+The `[vault]` extra pulls `hvac>=2.0,<3.0`. Without the extra,
+importing `dagstack.config.vault` raises `ImportError` with an
+actionable hint. The core `dagstack-config` package stays
+dependency-light.
+
+## Reference contents
+
+### Phase 1 — base API (ADR-0001)
+
+| Module / symbol | What it covers |
+|---|---|
+| `dagstack.config.Config` | Main class — `load`, `load_from`, `load_paths`; primitive getters (`get`, `get_string`, `get_int`, `get_number`, `get_bool`, `get_list`, `has`); `get_section(schema)` (pydantic). |
+| `dagstack.config.ConfigError`, `ConfigErrorReason` | Structured error type — `path`, `reason`, `details`, `source_id?`. Reasons fixed in `config-spec/_meta/error_reasons.yaml`. |
+| `dagstack.config.ConfigSource` | Protocol for source adapters — `id`, `load()`. |
+| `dagstack.config.YamlFileSource`, `JsonFileSource`, `InMemorySource` | Built-in Phase 1 sources. |
+| `dagstack.config.Subscription` | Handle for change subscriptions (Phase 1 — inactive; `on_change` / `on_section_change` return an inactive instance with `inactive_reason="subscription_without_watch"`). |
+| `dagstack.config.secrets_mask` | Field-name auto-masking — `is_secret_field`, `mask_value`, `MASKED_PLACEHOLDER`. |
+
+### Phase 2 — secrets surface (ADR-0002)
+
+| Module / symbol | What it covers |
+|---|---|
+| `dagstack.config.SecretSource` (Protocol) | Adapter contract — `scheme: str`, `id: str`, `resolve(path, ctx) -> SecretValue`, `close()`. |
+| `dagstack.config.AsyncSecretSource` (Protocol) | Async-flavoured parallel protocol — `resolve_async`, `close_async`. Distinct type from `SecretSource` so callers get correct typing. |
+| `dagstack.config.SecretRef` (`@dataclass(frozen=True, slots=True)`) | Opaque placeholder for an unresolved `${secret:...}` reference — `scheme`, `path`, `default?`, `origin_source`. Equality ignores `origin_source` (diagnostic-only). |
+| `dagstack.config.SecretValue` (`@dataclass(frozen=True, slots=True)`) | Result of `resolve()` — `value: str`, `source_id: str`, `version: str \| None`, `expires_at: datetime \| None`. |
+| `dagstack.config.ResolveContext` (`@dataclass(slots=True)`) | Per-call context — `attempt: int`, `deadline: datetime \| None`, `cancellation: Any`. |
+| `dagstack.config.EnvSecretSource` | Mandatory in-process adapter for the `env` scheme. `__init__(*, getenv=None)`. Auto-registered by the loader. |
+| `dagstack.config.vault.VaultSource` | Pilot adapter for HashiCorp Vault KV v2. `__init__(addr, auth, *, namespace=None, verify=True, timeout=30.0)`. Ships in the `[vault]` extra. |
+| `dagstack.config.vault.TokenAuth`, `AppRoleAuth`, `KubernetesAuth`, `VaultAuth` | Auth descriptors — frozen dataclasses; `VaultAuth` is the union type. |
+
+### `Config` Phase 2 methods
+
+- `Config.load_from(sources, *, eager_secrets=False)` — accepts a
+  heterogeneous list of `ConfigSource` and `SecretSource`; auto-
+  registers `EnvSecretSource` when none is passed.
+- `config.refresh_secrets()` — drops the resolved-secrets cache;
+  next `get*` re-resolves.
+- `config.snapshot(*, include_secrets=False)` — masked diagnostic
+  dump; `SecretRef` placeholders → `[MASKED]`. With
+  `include_secrets=True`, placeholders are resolved and field-name
+  suffix masking still applies.
+
+## Python idiom
+
+- **Naming** — `snake_case` for methods and dataclass fields, matching
+  the binding's convention. The wire-format reasons stay
+  `secret_unresolved` / `secret_backend_unavailable` /
+  `secret_permission_denied` (the `ConfigErrorReason` enum values
+  match the spec).
+- **Sync default** — `SecretSource.resolve()` is sync. The
+  `AsyncSecretSource` protocol with `resolve_async` is a parallel
+  type for binding-internal use; the loader picks the right method
+  based on the calling context. There is **no** `SecretScheme` enum
+  — schemes are plain lowercase strings; the registry lives in
+  `config-spec/_meta/secret_schemes.yaml`.
+- **Frozen dataclasses** — `SecretRef`, `SecretValue`, `TokenAuth`,
+  `AppRoleAuth`, `KubernetesAuth` are all `frozen=True, slots=True`
+  for safety and memory efficiency.
+- **Type aliases** — `VaultAuth` is a `TypeAlias` for the union
+  `TokenAuth | AppRoleAuth | KubernetesAuth`.
+
+## Generating the reference locally
+
+```bash
+pip install pydoc-markdown
+pip install 'dagstack-config[vault]'   # so the vault module imports cleanly
+cd <repo-root>
+make api-python
+```
+
+## Until the reference is generated
+
+- Docstrings are accessible through `help(dagstack.config)` in the
+  interpreter and from your IDE's LSP.
+- Guide pages: [Declare a section](/docs/guides/declaring-section),
+  [Testing](/docs/guides/testing).
+- Concept pages: [Secrets](/docs/concepts/secrets),
+  [Secret sources](/docs/concepts/secret-sources).
+- Specification:
+  [ADR-0001](/docs/spec/adr/0001-yaml-configuration),
+  [ADR-0002](/docs/spec/adr/0002-secret-references-and-sources).

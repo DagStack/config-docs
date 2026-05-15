@@ -1,0 +1,254 @@
+---
+sidebar_position: 1
+title: ADR-0001 · YAML configuration
+description: Normative contract — YAML transport, env interpolation, layered merge, typed access, subscription semantics, canonical JSON.
+slug: /spec/adr/0001-yaml-configuration
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# ADR-0001 · YAML configuration with env interpolation
+
+**Status**: accepted v2.0 (2026-04-19; v1.0 — 2026-04-17) · [Full normative text](https://github.com/dagstack/config-spec/blob/main/adr/0001-yaml-configuration.md)
+
+## Why a unified configuration specification
+
+Applications on dagstack are written in different languages (Python, TypeScript, Go) and use different default configuration libraries (`python-dotenv`, `dotenv`, `viper`). The result: the operator sees a different configuration model in every application, knowledge does not transfer between them, and the dev/staging/production split is implemented ad hoc.
+
+Neighboring ecosystems have solved the same problem the same way: **YAML + env interpolation + deployment layers + typed access through the language's native models**:
+
+- **`@backstage/config`** (Spotify) — YAML + env + deep merge + hot reload.
+- **Spring Boot** — `application.yml` + profiles + `@ConfigurationProperties`.
+- **HashiCorp Viper** — multi-format + env overrides + struct unmarshal.
+
+ADR-0001 codifies this model as a **language-agnostic contract** for the dagstack ecosystem — the transport format and API surface are the same in Python / TypeScript / Go.
+
+## Seven key decisions
+
+### 1. YAML as the primary transport format
+
+YAML 1.2 (compatible with YAML 1.1 parsers) — the same file is read consistently by every implementation. JSON is allowed as an equivalent (YAML 1.2 is a superset of JSON), for environments that lack a YAML parser.
+
+### 2. Env interpolation syntax
+
+```
+${VAR}              → the value of VAR; if unset, ConfigError(env_unresolved)
+${VAR:-default}     → the value of VAR; if unset or empty, the literal "default"
+```
+
+Semantics:
+
+- Interpolation runs **at file load time**, before merging and before type coercion.
+- The interpolated value is always a **string**. Typing happens inside the typed accessor.
+- `$$` escapes to `$`.
+- The default is a literal string; nested `${...}` inside default values is **not** interpolated.
+
+### 3. Configuration layers and merge rules
+
+Three layers in priority order:
+
+1. `app-config.yaml` — base (committed).
+2. `app-config.local.yaml` — developer overrides (gitignored).
+3. `app-config.${DAGSTACK_ENV}.yaml` — environment-specific (committed).
+
+**`DAGSTACK_ENV`**, not `APP_ENV` / `NODE_ENV` — a namespaced env variable to avoid collisions in multi-framework deployments.
+
+Merge strategy:
+
+- **Objects (maps)** — recursive deep merge.
+- **Arrays** — atomic replacement, not concatenation.
+
+Composite profiles (in the Spring Boot `prod,us-east` style) are **deferred** to Phase 2.
+
+### 4. Configuration access API
+
+**Pseudocode** for the contract (each implementation realizes it idiomatically):
+
+```
+Config.load(path):                   Config           # wrapper around loadFrom([YamlFileSource(path)])
+Config.load(paths[]):                Config
+Config.loadFrom(sources[]):          Config
+
+config.has(path):                    boolean
+config.get(path):                    Value
+config.getString(path, default?):    string
+config.getInt(path, default?):       int
+config.getNumber(path, default?):    float
+config.getBool(path, default?):      boolean
+config.getList(path):                Value[]
+
+config.getSection(path, schema):     TypedObject
+```
+
+- `path` is dotted (`database.host`, `plugins[0]`, `labels.kubernetes\.io/zone`).
+- `getSection` uses a native schema: pydantic / zod / struct tags.
+- **Isolation rule**: a component reads only its own section.
+
+**Naming convention — idiomatic per language**. The ADR fixes the
+semantics; each binding picks the case that matches its native style:
+
+- **Python** — `snake_case`: `config.get_string`, `config.get_int`,
+  `config.get_section`, `config.on_section_change`, `Config.load_from`.
+- **TypeScript** — `camelCase`: `config.getString`, `config.getInt`,
+  `config.getSection`, `config.onSectionChange`, `Config.loadFrom`.
+- **Go** — `PascalCase` (public API): `cfg.GetString`, `cfg.GetInt`,
+  `cfg.GetSection`, `cfg.OnSectionChange`, `config.LoadFrom`. For the
+  default-value semantics, Go appends a `Default` suffix
+  (`cfg.GetIntDefault(path, 10)`) instead of taking a `default`
+  parameter, so signatures stay unambiguous.
+
+**Sync vs async** is left to the implementation. Python is sync (Phase 1);
+TypeScript is async (`Promise<Config>` from `Config.load`); Go is sync
+with `context.Context` as the first argument and an `error` return.
+The implementation pins down its choice in a per-language ADR and the
+conformance runner.
+
+### 5. Error model
+
+```
+ConfigError {
+  path:        string                 # dotted error path
+  reason:      ConfigErrorReason      # enum, fixed in _meta/error_reasons.yaml
+  details:     string                 # human-readable message
+  source_id?:  string                 # which ConfigSource, if applicable
+}
+
+ConfigErrorReason ∈ {
+  missing, type_mismatch, env_unresolved, validation_failed,
+  parse_error, source_unavailable, reload_rejected
+}
+```
+
+Idiomatic implementations: Python `raise`, TypeScript `throw`, Go `return (value, error)`, Rust `Result<T, ConfigError>`, Java `throw`. The type name is conventional, but **the fields are mandatory**.
+
+### 6. The ConfigSource abstraction
+
+Every source implements a minimal interface:
+
+```
+id:                     string
+load():                 ConfigTree
+watch?(callback):       Subscription        # optional
+close?():               void                 # optional
+```
+
+Built-in Phase 1 sources: `YamlFileSource`, `JsonFileSource`, an in-memory source (`InMemorySource` in Python/TypeScript, `DictSource` in Go — a historical naming divergence; semantics are identical).
+
+Phase 2+ adapters on the roadmap: `EtcdSource`, `ConsulSource`, `VaultSource`, `HttpSource`, `SqlSource`, `KubernetesSource`.
+
+### 7. Subscriptions / reactive reload
+
+```
+config.onSectionChange(path, schema, callback) → Subscription {
+  unsubscribe():   void        # idempotent
+  active:          boolean
+  inactive_reason: string | null
+  path:            string
+}
+```
+
+**Behavior**:
+
+- If no source supports watching → the subscription is accepted but `active=false` with `inactive_reason = "subscription_without_watch"`.
+- **Atomic rollback** at the level of the entire tree: if any subscribed section fails validation, the whole reload is rolled back and no subscriber is notified.
+- Unsubscribe is idempotent; the callback is not invoked after unsubscribe even for reload cycles already in progress.
+- Callbacks are fire-and-forget (sync or async — depends on the implementation).
+
+This is a key safeguard against hidden bugs: the application behaves the same on sources with and without watching (only `active` differs).
+
+## A configuration example with three layers
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```yaml title="app-config.yaml"
+    database:
+      host: "${DB_HOST:-localhost}"
+      port: "${DB_PORT:-5432}"
+      name: "orders"
+      user: "${DB_USER}"
+      password: "${DB_PASSWORD}"
+      pool_size: 20
+
+    cache:
+      url: "${REDIS_URL:-redis://localhost:6379/0}"
+      ttl_min: 15
+
+    api:
+      port: 8080
+      request_timeout_s: 30
+    ```
+
+    ```yaml title="app-config.local.yaml (gitignored)"
+    database:
+      pool_size: 5            # fewer connections locally
+    api:
+      request_timeout_s: 120  # slow debugger
+    ```
+
+    ```yaml title="app-config.production.yaml"
+    database:
+      host: "prod-db.internal.example.com"
+      pool_size: 100
+    cache:
+      url: "redis://prod-cache.internal.example.com:6379/0"
+    ```
+
+    ```python title="main.py"
+    from dagstack.config import Config
+
+    config = Config.load("app-config.yaml")
+    # DAGSTACK_ENV=production → resulting config:
+    #   database.host = "prod-db.internal.example.com"   (from production)
+    #   database.pool_size = 5                            (from local; production didn't override)
+    #   database.port = 5432                              (from base)
+    #   cache.url = "redis://prod-cache.internal.example.com:6379/0"
+    #   api.request_timeout_s = 120                       (from local)
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts title="main.ts"
+    import { Config } from "@dagstack/config";
+
+    const config = await Config.load("app-config.yaml");
+    // DAGSTACK_ENV=production — same semantics, async version.
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="main.go"
+    cfg, err := config.Load(context.Background(), "app-config.yaml")
+    // DAGSTACK_ENV=production — same semantics, sync with error.
+    ```
+  </TabItem>
+</Tabs>
+
+## Consequences
+
+**Positive:**
+
+- The operator sees a single configuration model regardless of the application's language.
+- Secrets are passed through env interpolation by default — they never reach git.
+- Hot reload is supported without breaking API changes when the source is swapped (YamlFileSource → EtcdSource — plugin code is unaffected).
+- Atomic rollback prevents partial application of an invalid configuration.
+
+**Trade-offs:**
+
+- **The restriction on nested defaults** (`${VAR:-${OTHER}}` does not work) keeps the parser simple but sometimes forces a two-step approach in shell scripts.
+- **Full-array replacement** — every override must specify the full array; there is no syntax for "append an element".
+- **Sync vs async chosen per implementation** — adds a documentation discrepancy between bindings ("in Python it's async, in Go sync"); softened by a per-language ADR addendum.
+
+**Forbidden by this ADR**:
+
+- An implementation cannot introduce its own merge model (deep merge for arrays, shallow for nested objects) — deep merge for objects and replacement for arrays are normatively required.
+- A `ConfigError` without `path` / `reason` / `details` — these fields are mandatory.
+- Silently falling back to an empty string when an env variable without a default is missing — this is **an error**; the plugin must not start.
+
+## Related ADRs and specs
+
+- [`plugin-system-spec` ADR-0006 § discovery](https://github.com/dagstack/plugin-system-spec/blob/main/adr/0006-file-based-plugin-discovery.md) — discovery uses the config for `plugin_dirs`.
+- `logger-spec` — reads the `logging` section through the config.
+- `tenancy-spec` — reads the `tenancy` section.
+
+## Normative source
+
+The full text with formal canonical-JSON rules (a subset of RFC 8785), specification artifacts, and the adapter roadmap: [`config-spec/adr/0001-yaml-configuration.md`](https://github.com/dagstack/config-spec/blob/main/adr/0001-yaml-configuration.md).

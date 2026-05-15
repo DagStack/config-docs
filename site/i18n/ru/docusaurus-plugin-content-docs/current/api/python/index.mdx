@@ -1,0 +1,38 @@
+---
+sidebar_position: 1
+title: Python API — обзор
+description: Навигация по справочнику публичного API пакета dagstack-config; страницы генерируются pydoc-markdown из исходников.
+slug: /api/python
+---
+
+# Python API — обзор
+
+Справочник генерируется автоматически из исходников пакета `dagstack-config` через [pydoc-markdown](https://niklasrosenstein.github.io/pydoc-markdown/).
+
+:::info Генерация отложена
+Страницы для этого первого релиза не сгенерированы. Конфигурация пайплайна лежит в `pydoc-markdown.yaml` в корне репозитория; запуск — `make api-python`. Содержимое появится в последующих коммитах, когда реализация стабилизируется.
+:::
+
+## Содержание справочника (планируется)
+
+| Модуль | Что покрывает |
+|---|---|
+| `dagstack.config` | Публичный верхний уровень — `Config`, `load`, `load_from`, `load_paths`, геттеры (snake_case), ошибки. |
+| `dagstack.config.sources` | `ConfigSource`, `YamlFileSource`, `JsonFileSource`, `InMemorySource`. |
+| `dagstack.config.errors` | `ConfigError`, `ConfigErrorReason`. |
+| `dagstack.config.subscription` | `Subscription` (Phase 1 — неактивна, callback никогда не вызывается). |
+
+## Локальная генерация
+
+```bash
+pip install pydoc-markdown
+pip install dagstack-config      # в активное окружение
+cd <repo-root>
+make api-python
+```
+
+## Пока справочник не сгенерирован
+
+- Docstring'и доступны через `help(dagstack.config)` в интерпретаторе.
+- Страницы руководств: [Объявление секции](/docs/guides/declaring-section), [Тестирование](/docs/guides/testing).
+- Спецификация: [ADR-0001](/docs/spec/adr/0001-yaml-configuration).
